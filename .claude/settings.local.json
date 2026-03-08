@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pip --version 2>&1 || python3 -m ensurepip --default-pip 2>&1)",
+      "Bash(curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && python3 /tmp/get-pip.py --user)",
+      "Bash(dpkg -l | grep -E \"xvfb|pyqt5\" 2>/dev/null || echo \"Need to check packages\")",
+      "Bash(pip3 install -r requirements.txt)",
+      "Bash(pip3 install PyMuPDF==1.21.1 --break-system-packages)",
+      "Bash(python3 test_xvfb.py 2>&1)",
+      "Bash(python3 -c \"import pymupdf; doc = pymupdf.open\\(\\); print\\('PyMuPDF version:', pymupdf.__doc__.split\\(\\)[1] if pymupdf.__doc__ else 'unknown'\\)\")",
+      "Bash(python3 /home/feifei/Unipdf/test_hover.py 2>&1)"
+    ]
+  }
+}

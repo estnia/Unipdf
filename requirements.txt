@@ -1,0 +1,11 @@
+# Unipdf 依赖列表
+# 适配 UOS V20 (Debian 10) / Python 3.7+
+# 注意：固定版本以确保 Python 3.7 兼容性
+
+# PDF 渲染引擎
+# 1.21.1 是最后一个官方支持 Python 3.7 的稳定版本
+PyMuPDF==1.21.1
+
+# GUI 框架
+# 5.15.9 是 Python 3.7 兼容的最后一个稳定版本
+PyQt5==5.15.9
