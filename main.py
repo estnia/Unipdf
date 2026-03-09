@@ -125,9 +125,13 @@ class RenderWorker(QThread):
                 self.error.emit(self.page_idx, str(e))
 
     def stop(self):
-        """停止渲染"""
+        """停止渲染 - 安全地等待线程完成"""
         self._is_running = False
-        self.wait(100)  # 等待100ms
+        # 等待线程完成，最多等待 5 秒
+        if not self.wait(5000):
+            # 如果线程仍未完成，强制终止并等待
+            self.terminate()
+            self.wait(1000)
 
 
 # 自动目录生成 - 正则表达式配置
@@ -415,10 +419,12 @@ class PDFViewer(QMainWindow):
         # ==================== P0/P2: 平滑缩放优化与多级缓存 ====================
         # L1 缓存: 当前显示缩放级别的页面图像 {page_idx: QPixmap}
         self._render_cache = {}
-        # P2: L2 缓存 - 其他缩放级别的图像，最多保留 3 个缩放级别
+        # P2: L2 缓存 - 关键缩放级别的图像（阶梯式缓存）
         # 结构: {zoom_percent: {page_idx: QPixmap}}
         self._l2_cache = {}
-        self._max_l2_zoom_levels = 3  # 最多保留的缩放级别数
+        # 关键缩放级别（阶梯式）：只在这些级别进行PDF渲染，其他用图像插值
+        self._zoom_steps = [50, 75, 100, 125, 150, 200, 300, 400]  # 百分比
+        self._max_l2_zoom_levels = 8  # 保留所有关键级别
         # 当前显示的基础图像（用于即时拉伸）
         self._base_pixmaps = {}
         # 正在进行的渲染任务 {page_idx: RenderWorker}
@@ -1121,9 +1127,14 @@ class PDFViewer(QMainWindow):
         self._zoom_timer.start(150)
 
     def _apply_zoom_preview(self, factor: float):
-        """P0: 即时缩放预览 - 使用 QPainter 拉伸当前显示的图像"""
+        """P3: 即时缩放预览 - 使用 L2 缓存的最近级别进行图像插值"""
         if not self.page_labels:
             return
+
+        target_zoom_percent = int(self._target_zoom * 100)
+
+        # 找到最接近的关键缩放级别
+        nearest_zoom = self._find_nearest_zoom_step(target_zoom_percent)
 
         for i, page_label in enumerate(self.page_labels):
             # 获取当前显示的大小
@@ -1133,13 +1144,37 @@ class PDFViewer(QMainWindow):
             new_width = int(current_size.width() * factor)
             new_height = int(current_size.height() * factor)
 
-            # 获取基础图像（原始渲染的图像）
-            if i in self._base_pixmaps:
-                base_pixmap = self._base_pixmaps[i]
+            # P3: 优先从 L2 缓存获取最接近的缩放级别
+            source_pixmap = None
+            source_zoom = None
+
+            # 1. 首先尝试精确匹配目标缩放级别
+            if target_zoom_percent in self._l2_cache and i in self._l2_cache[target_zoom_percent]:
+                source_pixmap = self._l2_cache[target_zoom_percent][i]
+                source_zoom = target_zoom_percent
+            # 2. 其次尝试最近的关键级别
+            elif nearest_zoom in self._l2_cache and i in self._l2_cache[nearest_zoom]:
+                source_pixmap = self._l2_cache[nearest_zoom][i]
+                source_zoom = nearest_zoom
+            # 3. 回退到当前基础图像
+            elif i in self._base_pixmaps:
+                source_pixmap = self._base_pixmaps[i]
+                source_zoom = int(self.zoom_factor * 100)
+
+            if source_pixmap:
+                # 计算需要从源缩放级别到目标缩放级别的比例
+                if source_zoom and source_zoom != target_zoom_percent:
+                    # 源图像是按 source_zoom% 渲染的，需要缩放到 target_zoom_percent%
+                    scale_factor = target_zoom_percent / source_zoom
+                    actual_width = int(source_pixmap.width() * scale_factor)
+                    actual_height = int(source_pixmap.height() * scale_factor)
+                else:
+                    actual_width = new_width
+                    actual_height = new_height
 
                 # 创建缩放后的图像
-                scaled = base_pixmap.scaled(
-                    new_width, new_height,
+                scaled = source_pixmap.scaled(
+                    actual_width, actual_height,
                     Qt.KeepAspectRatio,
                     Qt.SmoothTransformation  # 平滑变换，减少锯齿
                 )
@@ -1155,14 +1190,45 @@ class PDFViewer(QMainWindow):
         # 更新状态栏显示目标缩放比例
         self.statusBar().showMessage(f"共 {self.total_pages} 页 | 缩放: {self._target_zoom * 100:.0f}% (渲染中...)")
 
+    def _find_nearest_zoom_step(self, zoom_percent: int) -> int:
+        """P3: 找到最接近的关键缩放级别"""
+        if not self._zoom_steps:
+            return 100
+
+        # 找到最接近的关键级别
+        nearest = self._zoom_steps[0]
+        min_diff = abs(zoom_percent - nearest)
+
+        for step in self._zoom_steps[1:]:
+            diff = abs(zoom_percent - step)
+            if diff < min_diff:
+                min_diff = diff
+                nearest = step
+
+        return nearest
+
     def _do_hd_render(self):
-        """P0: 防抖后执行高清异步渲染"""
+        """P3: 防抖后执行高清异步渲染 - 只渲染到最接近的关键级别"""
         if not self.doc or abs(self._target_zoom - self.zoom_factor) < 0.01:
             return
 
-        # 更新实际缩放值
+        # P3: 找到最接近的关键缩放级别
+        target_zoom_percent = int(self._target_zoom * 100)
+        nearest_zoom_percent = self._find_nearest_zoom_step(target_zoom_percent)
+
+        # 如果目标缩放正好是关键级别，或者差距很小，直接使用
+        if abs(target_zoom_percent - nearest_zoom_percent) <= 10:
+            # 使用关键级别进行渲染
+            self._do_render_at_zoom(nearest_zoom_percent / 100.0)
+        else:
+            # 差距较大，需要精确渲染目标级别
+            self._do_render_at_zoom(self._target_zoom)
+
+    def _do_render_at_zoom(self, zoom: float):
+        """P3: 在指定缩放级别执行渲染"""
         old_zoom = self.zoom_factor
-        self.zoom_factor = self._target_zoom
+        self.zoom_factor = zoom
+        zoom_percent = int(zoom * 100)
 
         # 清除 UI 矩形缓存（zoom 改变后需要重新计算）
         if hasattr(self, 'page_words') and self.page_words:
@@ -1170,8 +1236,46 @@ class PDFViewer(QMainWindow):
                 if "ui_rect" in w:
                     del w["ui_rect"]
 
+        # P3: 如果该缩放级别已在 L2 缓存中，直接使用
+        if zoom_percent in self._l2_cache:
+            cached_pages = self._l2_cache[zoom_percent]
+            if len(cached_pages) == self.total_pages:
+                # 完全缓存命中，直接显示
+                self._display_from_l2_cache(zoom_percent)
+                return
+
         # P0: 启动异步渲染所有页面
         self._start_async_render()
+
+    def _display_from_l2_cache(self, zoom_percent: int):
+        """P3: 从 L2 缓存直接显示所有页面"""
+        if zoom_percent not in self._l2_cache:
+            return
+
+        cached_pages = self._l2_cache[zoom_percent]
+        target_size = None
+
+        for page_idx in range(self.total_pages):
+            if page_idx not in cached_pages:
+                continue
+
+            pixmap = cached_pages[page_idx]
+            if page_idx >= len(self.page_labels):
+                continue
+
+            page_label = self.page_labels[page_idx]
+            page_label.setPixmap(pixmap)
+            page_label.setFixedSize(pixmap.size())
+            self._base_pixmaps[page_idx] = pixmap
+
+            if page_idx < len(self.page_overlays):
+                self.page_overlays[page_idx].resize(page_label.size())
+
+            if target_size is None:
+                target_size = pixmap.size()
+
+        # 更新状态栏
+        self.statusBar().showMessage(f"共 {self.total_pages} 页 | 缩放: {zoom_percent}%")
 
     def _start_async_render(self):
         """P0/P1/P2: 启动异步渲染任务 - 支持视口裁剪和多级缓存"""
@@ -1258,9 +1362,11 @@ class PDFViewer(QMainWindow):
             worker.start()
 
     def _cancel_active_workers(self):
-        """P0: 取消所有正在进行的渲染任务"""
-        for worker in self._active_workers.values():
+        """P0: 取消所有正在进行的渲染任务 - 安全地等待线程完成"""
+        # 先通知所有线程停止
+        for worker in list(self._active_workers.values()):
             worker.stop()
+        # 清空活动任务列表
         self._active_workers.clear()
 
     def _on_render_finished(self, page_idx: int, zoom_percent: int, dpi_scale: float, pixmap: QPixmap):
@@ -1313,14 +1419,13 @@ class PDFViewer(QMainWindow):
             self.statusBar().showMessage(f"共 {self.total_pages} 页 | 缩放: {self.zoom_factor * 100:.0f}%")
 
     def _add_to_l2_cache(self, page_idx: int, zoom_percent: int, pixmap: QPixmap):
-        """P2: 添加渲染结果到 L2 缓存"""
+        """P3: 添加渲染结果到 L2 缓存 - 只缓存关键缩放级别"""
+        # P3: 只缓存关键缩放级别
+        if zoom_percent not in self._zoom_steps:
+            return  # 非关键级别，不缓存
+
         # 确保该缩放级别的缓存存在
         if zoom_percent not in self._l2_cache:
-            # 清理旧缓存（如果超过最大缩放级别数）
-            if len(self._l2_cache) >= self._max_l2_zoom_levels:
-                # 删除最早的缩放级别
-                oldest_zoom = min(self._l2_cache.keys())
-                del self._l2_cache[oldest_zoom]
             self._l2_cache[zoom_percent] = {}
 
         # 存储到缓存（深拷贝）
