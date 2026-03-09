@@ -1166,8 +1166,10 @@ class PDFViewer(QMainWindow):
                 if source_zoom and source_zoom != target_zoom_percent:
                     # 源图像是按 source_zoom% 渲染的，需要缩放到 target_zoom_percent%
                     scale_factor = target_zoom_percent / source_zoom
-                    actual_width = int(source_pixmap.width() * scale_factor)
-                    actual_height = int(source_pixmap.height() * scale_factor)
+                    # 使用 size() 获取逻辑尺寸，而非 width()/height() 获取设备像素
+                    source_size = source_pixmap.size()
+                    actual_width = int(source_size.width() * scale_factor)
+                    actual_height = int(source_size.height() * scale_factor)
                 else:
                     actual_width = new_width
                     actual_height = new_height
@@ -1178,6 +1180,9 @@ class PDFViewer(QMainWindow):
                     Qt.KeepAspectRatio,
                     Qt.SmoothTransformation  # 平滑变换，减少锯齿
                 )
+
+                # 继承源图像的 devicePixelRatio
+                scaled.setDevicePixelRatio(source_pixmap.devicePixelRatio())
 
                 # 更新 QLabel 显示
                 page_label.setPixmap(scaled)
