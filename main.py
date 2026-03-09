@@ -23,7 +23,8 @@ from PyQt5.QtWidgets import (
     QSplitter, QTreeWidget, QTreeWidgetItem, QScrollArea, QLabel,
     QAction, QFileDialog, QMessageBox, QRubberBand, QMenu,
     QStackedWidget, QListWidget, QListWidgetItem, QToolButton, QFrame,
-    QSizePolicy, QLineEdit, QPushButton, QShortcut, QProgressDialog
+    QSizePolicy, QLineEdit, QPushButton, QShortcut, QProgressDialog,
+    QTabWidget
 )
 from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer, QMimeData, QThread, pyqtSignal
 from PyQt5.QtGui import (
@@ -141,8 +142,8 @@ LEGAL_PATTERNS = {
 }
 
 GBT_PATTERNS = {
-    "L1": re.compile(r'^(\d+)\s+[\u4e00-\u9fa5]', re.UNICODE),  # 1 范围
-    "L2": re.compile(r'^(\d+\.\d+)(\s+[\u4e00-\u9fa5])', re.UNICODE)  # 1.1 术语
+    "L1": re.compile(r'^(\d+)\s+[\u4e00-\u9fa5]', re.UNICODE),  # 1-99 范围等
+    "L2": re.compile(r'^(\d+\.\d+)\s+[\u4e00-\u9fa5]', re.UNICODE)  # 1.1, 2.1, 3.1, 4.1 等二级目录
 }
 
 GENERAL_PATTERNS = {
@@ -195,19 +196,33 @@ class AutoTocWorker(QThread):
                 self.progress.emit(page_idx + 1, total_pages)
                 page = doc[page_idx]
 
-                # 区域裁剪：忽略边缘10%（排除页眉页码）
+                # 区域裁剪：忽略边缘5%（排除页眉页码）
                 crop_rect = self._get_crop_rect(page.rect)
 
-                # 获取文本块
-                blocks = page.get_text("blocks", clip=crop_rect)
+                # 获取文本行（而非块），这样每个章节标题都能被独立检测
+                lines = self._get_text_lines(page, crop_rect)
 
-                for block in blocks:
-                    result = self._process_block(
-                        block, page_idx, base_size,
-                        l1_pattern, l2_pattern
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    next_line = lines[i + 1] if i + 1 < len(lines) else None
+                    next_line_text = next_line["text"] if next_line else None
+
+                    result = self._process_line(
+                        line, page_idx, base_size,
+                        l1_pattern, l2_pattern, next_line_text
                     )
                     if result:
                         toc_candidates.append(result)
+                        # 如果合并了下一行（L1纯数字或L2章节号单独成行），跳过下一行
+                        text = line["text"].strip()
+                        is_l1_digit = text.isdigit()
+                        is_l2_digit_only = bool(re.match(r'^\d+\.\d+$', text))
+                        if next_line_text and result["text"] != text:
+                            if is_l1_digit or is_l2_digit_only:
+                                i += 2
+                                continue
+                    i += 1
 
                 # 内存优化 - 清理未引用的对象
                 if page_idx % 10 == 0:
@@ -293,13 +308,123 @@ class AutoTocWorker(QThread):
             return GENERAL_PATTERNS["L1"], GENERAL_PATTERNS["L2"]
 
     def _get_crop_rect(self, page_rect: fitz.Rect) -> fitz.Rect:
-        """获取裁剪后的页面区域（忽略边缘10%）"""
-        margin = 0.1  # 10% 边距
+        """获取裁剪后的页面区域（忽略边缘5%，避免过度裁剪章节标题）"""
+        margin = 0.05  # 5% 边距（从10%减小，避免裁剪到章节标题）
         x0 = page_rect.x0 + page_rect.width * margin
         y0 = page_rect.y0 + page_rect.height * margin
         x1 = page_rect.x1 - page_rect.width * margin
         y1 = page_rect.y1 - page_rect.height * margin
         return fitz.Rect(x0, y0, x1, y1)
+
+    def _get_text_lines(self, page: fitz.Page, clip_rect: fitz.Rect) -> list:
+        """从页面提取文本行，返回每行的文本和坐标"""
+        lines = []
+        blocks = page.get_text("dict", clip=clip_rect)["blocks"]
+
+        for block in blocks:
+            if "lines" not in block:
+                continue
+            for line in block["lines"]:
+                # 收集该行所有 span 的文本
+                line_text = ""
+                for span in line["spans"]:
+                    line_text += span["text"]
+
+                line_text = line_text.strip()
+                if not line_text:
+                    continue
+
+                # 获取行的边界框
+                bbox = line["bbox"]
+                lines.append({
+                    "text": line_text,
+                    "bbox": bbox,
+                    "font_size": line["spans"][0]["size"] if line["spans"] else 12.0
+                })
+
+        return lines
+
+    def _process_line(self, line: dict, page_idx: int, base_size: float,
+                      l1_pattern, l2_pattern, next_line_text: str = None) -> dict:
+        """处理单个文本行，提取标题候选"""
+        text = line["text"]
+        x0, y0, x1, y1 = line["bbox"]
+
+        # 清理文本
+        text = text.strip()
+        if not text or len(text) > 200:
+            return None
+
+        # 尝试匹配 L2（如 "2.1 术语"）
+        l2_match = l2_pattern.match(text)
+        if l2_match:
+            # 过滤掉过长的匹配（真正的章节标题通常不超过50个字符）
+            if len(text) > 50:
+                return None
+            return {
+                "page": page_idx,
+                "text": text,
+                "bbox": (x0, y0, x1, y1),
+                "level": 2,
+                "match_type": "L2"
+            }
+
+        # 特殊处理：L2 章节号单独成行（如 "4.4"）
+        if re.match(r'^\d+\.\d+$', text) and next_line_text:
+            next_text = next_line_text.strip()
+            # 检查下一行是否是章节标题（纯中文，长度合适，不以标点开头，不是附录）
+            if next_text and len(next_text) <= 20:
+                if next_text[0] not in '。，、；：！？.' and '附录' not in next_text:
+                    # 下一行应以常见的章节标题词汇开头
+                    chapter_keywords = ['范围', '术语', '定义', '要求', '内容', '标示', '其他', '总则', '规定', '预包装', '食品', '配料', '生产', '保质期', '规格', '主要', '推荐', '豁免', '基本']
+                    if any(next_text.startswith(kw) for kw in chapter_keywords):
+                        combined = text + " " + next_text
+                        return {
+                            "page": page_idx,
+                            "text": combined,
+                            "bbox": (x0, y0, x1, y1),
+                            "level": 2,
+                            "match_type": "L2"
+                        }
+
+        # 尝试匹配 L1（如 "1 范围"、"10 总则"、"6 附录A"）
+        l1_match = l1_pattern.match(text)
+        if l1_match:
+            # 检查是否包含日期关键词
+            if any(keyword in text for keyword in ['年', '月', '日', '发布', '实施']):
+                return None
+            # 检查数字是否太大（超过100可能是页码或日期）
+            num = int(l1_match.group(1))
+            if num > 100:
+                return None
+            return {
+                "page": page_idx,
+                "text": text,
+                "bbox": (x0, y0, x1, y1),
+                "level": 1,
+                "match_type": "L1"
+            }
+
+        # 特殊处理：如果当前行是纯数字，且下一行是纯中文标题或附录，则合并
+        if text.isdigit() and next_line_text:
+            next_text = next_line_text.strip()
+            # 检查下一行是否是章节标题（纯中文，长度合适）
+            if next_text and len(next_text) <= 20:
+                # 下一行不应以标点符号开头
+                if next_text[0] not in '。，、；：！？.':
+                    # 下一行应以常见的章节标题词汇开头，或是附录
+                    chapter_keywords = ['范围', '术语', '定义', '要求', '内容', '标示', '其他', '总则', '规定', '基本', '附录']
+                    if any(next_text.startswith(kw) for kw in chapter_keywords):
+                        combined = text + " " + next_text
+                        return {
+                            "page": page_idx,
+                            "text": combined,
+                            "bbox": (x0, y0, x1, y1),
+                            "level": 1,
+                            "match_type": "L1"
+                        }
+
+        return None
 
     def _process_block(self, block, page_idx: int, base_size: float,
                        l1_pattern, l2_pattern) -> dict:
@@ -308,18 +433,28 @@ class AutoTocWorker(QThread):
 
         # 清理文本
         text = text.strip()
-        if not text or len(text) > 200:  # 标题不会太长
+        if not text or len(text) > 300:
             return None
 
-        # 独立行判定：标题不应以句号结尾
-        if text.endswith(('。', '.', '；', ';')):
-            return None
-
-        # 正则匹配
+        # 先尝试匹配
         l1_match = l1_pattern.match(text)
         l2_match = l2_pattern.match(text) if not l1_match else None
 
         if not l1_match and not l2_match:
+            return None
+
+        # 对于L1，过滤掉日期（如 "2010 年"、"20 日" 等）
+        if l1_match:
+            # 检查是否包含日期关键词
+            if any(keyword in text for keyword in ['年', '月', '日', '发布', '实施']):
+                return None
+            # 检查数字是否太大（超过100可能是页码或日期）
+            num = int(l1_match.group(1))
+            if num > 100:
+                return None
+
+        # 对于国标/法律文档，条款文本可能以句号结尾
+        if text.endswith(('。', '.', '；', ';')) and not (l1_match or l2_match):
             return None
 
         result = {
@@ -368,6 +503,411 @@ class AutoTocWorker(QThread):
         return ''.join(text.split()).lower()
 
 
+class PDFTabDocument(QWidget):
+    """
+    单个标签页的文档容器
+    封装单个文档的所有状态和视图
+    """
+
+    def __init__(self, file_path=None, parent=None):
+        super().__init__(parent)
+
+        # ==================== 文档状态 ====================
+        self.doc = None  # fitz.Document 对象
+        self.file_path = None  # 文件路径
+        self.current_page = 0  # 当前页码
+        self.zoom_factor = 1.0  # 缩放因子
+        self._target_zoom = 1.0  # 目标缩放
+        self.total_pages = 0  # 总页数
+        self._document_modified = False  # 修改标记
+
+        # ==================== 渲染缓存 ====================
+        self._l2_cache = {}
+        self._base_pixmaps = {}
+        self._active_workers = {}
+
+        # ==================== 文本选择 ====================
+        self.selection_start_char = None
+        self.selection_end_char = None
+        self.current_selected_text = ""
+        self.page_text_chars = []
+        self.page_words = []
+        self.is_selecting = False
+        self.current_page_label = None
+        self.rubber_band = None
+
+        # ==================== 注释 ====================
+        self._annot_hotspot_map = {}
+        self._current_hover_annot = None
+
+        # ==================== UI 组件 ====================
+        self.page_labels = []
+        self.page_overlays = []
+
+        # 初始化视图
+        self._init_view()
+
+        # 渲染定时器
+        self.render_timer = QTimer()
+        self.render_timer.setSingleShot(True)
+        self.render_timer.timeout.connect(self._do_render)
+
+        # 缩放置时器
+        self._zoom_timer = QTimer()
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.timeout.connect(self._do_hd_render)
+
+        # 剪贴板
+        self.clipboard = QApplication.clipboard()
+
+        # 如果提供了文件路径，打开文档
+        if file_path:
+            self.open_document(file_path)
+
+    def _init_view(self):
+        """初始化视图组件"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 滚动区域
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setAlignment(Qt.AlignCenter)
+        self.scroll_area.setStyleSheet("QScrollArea { background-color: #666666; }")
+
+        # 页面容器
+        self.pages_container = QWidget()
+        self.pages_container.setStyleSheet("QWidget { background-color: #555555; }")
+        self.pages_layout = QVBoxLayout(self.pages_container)
+        self.pages_layout.setSpacing(10)
+        self.pages_layout.setContentsMargins(10, 10, 10, 10)
+        self.pages_layout.setAlignment(Qt.AlignCenter)
+
+        self.scroll_area.setWidget(self.pages_container)
+        layout.addWidget(self.scroll_area)
+
+        # 启用鼠标跟踪
+        self.pages_container.setMouseTracking(True)
+
+    def open_document(self, file_path: str) -> bool:
+        """打开 PDF 文档"""
+        try:
+            self.close_document()
+
+            self.doc = fitz.open(file_path)
+            self.file_path = file_path
+            self.total_pages = len(self.doc)
+            self.current_page = 0
+            self.zoom_factor = 1.0
+            self._target_zoom = 1.0
+            self._document_modified = False
+
+            # 清除缓存
+            self._l2_cache.clear()
+            self._base_pixmaps.clear()
+
+            return True
+        except Exception as e:
+            print(f"无法打开 PDF 文件: {e}")
+            return False
+
+    def close_document(self):
+        """关闭文档"""
+        self._cancel_active_workers()
+
+        if self.doc:
+            try:
+                self.doc.close()
+            except:
+                pass
+            self.doc = None
+
+        self.file_path = None
+        self.total_pages = 0
+        self.current_page = 0
+        self.zoom_factor = 1.0
+        self._target_zoom = 1.0
+        self._document_modified = False
+
+        self._l2_cache.clear()
+        self._base_pixmaps.clear()
+        self._annot_hotspot_map.clear()
+
+        self._clear_all_pages()
+        self._clear_text_selection()
+
+    def save_document(self) -> bool:
+        """保存文档"""
+        if not self.doc or not self.file_path:
+            return False
+
+        try:
+            self.doc.save(self.file_path, incremental=True)
+            self._document_modified = False
+            return True
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "incremental" in error_msg or "encryption" in error_msg:
+                try:
+                    import shutil
+                    temp_path = self.file_path + ".tmp"
+                    self.doc.save(temp_path)
+                    shutil.move(temp_path, self.file_path)
+                    self._document_modified = False
+                    return True
+                except:
+                    return False
+            return False
+
+    def is_modified(self) -> bool:
+        """返回是否已修改"""
+        return self._document_modified
+
+    def mark_modified(self, modified: bool = True):
+        """标记修改状态"""
+        self._document_modified = modified
+
+    def get_file_name(self) -> str:
+        """获取文件名"""
+        if self.file_path:
+            return os.path.basename(self.file_path)
+        return "未命名"
+
+    def _do_render(self):
+        """执行渲染"""
+        if not self.doc:
+            return
+
+        self._cancel_active_workers()
+
+        try:
+            zoom = self.zoom_factor
+            zoom_percent = int(zoom * 100)
+
+            screen = QApplication.primaryScreen()
+            dpi_scale = screen.logicalDotsPerInchX() / 96.0 if screen else 1.0
+            device_ratio = screen.devicePixelRatio() if screen else 1.0
+
+            self._clear_all_pages()
+            self._base_pixmaps.clear()
+
+            l2_cache = self._l2_cache.get(zoom_percent, {})
+
+            for page_idx in range(self.total_pages):
+                if page_idx in l2_cache:
+                    qpixmap = l2_cache[page_idx]
+                    self._base_pixmaps[page_idx] = qpixmap
+                else:
+                    page = self.doc[page_idx]
+                    mat = fitz.Matrix(zoom * dpi_scale, zoom * dpi_scale)
+                    pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
+
+                    img = QImage(
+                        pix.samples, pix.width, pix.height, pix.stride,
+                        QImage.Format_RGB888 if pix.n == 3 else QImage.Format_ARGB32
+                    ).copy()
+
+                    qpixmap = QPixmap.fromImage(img)
+                    qpixmap.setDevicePixelRatio(device_ratio)
+
+                    self._base_pixmaps[page_idx] = qpixmap
+                    self._add_to_l2_cache(page_idx, zoom_percent, qpixmap)
+
+                qpixmap = self._base_pixmaps[page_idx]
+
+                page_label = QLabel()
+                page_label.setPixmap(qpixmap)
+                page_label.setAlignment(Qt.AlignCenter)
+                page_label.setStyleSheet("QLabel { background-color: white; }")
+                page_label.setFixedSize(qpixmap.size())
+
+                overlay = QLabel(page_label)
+                overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+                overlay.setStyleSheet("QLabel { background-color: transparent; }")
+                overlay.resize(page_label.size())
+                overlay.hide()
+
+                page_label.page_index = page_idx
+                self.page_labels.append(page_label)
+                self.page_overlays.append(overlay)
+
+                page_label.setMouseTracking(True)
+                self.pages_layout.addWidget(page_label)
+
+            self.pages_layout.addStretch()
+            self._clear_text_selection()
+
+        except Exception as e:
+            print(f"渲染失败: {e}")
+
+    def _clear_all_pages(self):
+        """清除所有页面"""
+        while self.pages_layout.count():
+            item = self.pages_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.page_labels.clear()
+        self.page_overlays.clear()
+
+    def _add_to_l2_cache(self, page_idx: int, zoom_percent: int, pixmap: QPixmap):
+        """添加到 L2 缓存"""
+        if zoom_percent not in self._l2_cache:
+            self._l2_cache[zoom_percent] = {}
+        self._l2_cache[zoom_percent][page_idx] = pixmap.copy()
+
+    def zoom(self, factor: float):
+        """缩放页面"""
+        if not self.doc:
+            return
+
+        new_zoom = self.zoom_factor * factor
+        new_zoom = max(0.1, min(5.0, new_zoom))
+
+        if abs(new_zoom - self._target_zoom) < 0.01:
+            return
+
+        self._target_zoom = new_zoom
+        self.zoom_factor = new_zoom
+
+        self._apply_zoom_preview(factor)
+        self._zoom_timer.stop()
+        self._zoom_timer.start(150)
+
+    def _apply_zoom_preview(self, factor: float):
+        """应用缩放预览"""
+        if not self.page_labels:
+            return
+
+        for i, page_label in enumerate(self.page_labels):
+            if i not in self._base_pixmaps:
+                continue
+
+            base_pixmap = self._base_pixmaps[i]
+            new_size = base_pixmap.size() * factor
+
+            scaled = base_pixmap.scaled(
+                int(new_size.width()), int(new_size.height()),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            scaled.setDevicePixelRatio(base_pixmap.devicePixelRatio())
+
+            page_label.setPixmap(scaled)
+            page_label.setFixedSize(scaled.size())
+
+            if i < len(self.page_overlays):
+                self.page_overlays[i].resize(page_label.size())
+
+    def _do_hd_render(self):
+        """高清渲染"""
+        if not self.doc:
+            return
+        self._do_render()
+
+    def zoom_reset(self):
+        """重置缩放"""
+        if not self.doc:
+            return
+        self._target_zoom = 1.0
+        self.zoom_factor = 1.0
+        self._do_render()
+
+    def prev_page(self):
+        """上一页"""
+        if self.current_page > 0:
+            self.current_page -= 1
+
+    def next_page(self):
+        """下一页"""
+        if self.current_page < self.total_pages - 1:
+            self.current_page += 1
+
+    def go_to_page(self, page_idx: int):
+        """跳转到指定页"""
+        if 0 <= page_idx < self.total_pages:
+            self.current_page = page_idx
+
+    def _cancel_active_workers(self):
+        """取消活跃渲染任务"""
+        for worker in list(self._active_workers.values()):
+            worker.stop()
+        self._active_workers.clear()
+
+    def _clear_text_selection(self):
+        """清除文本选择"""
+        for overlay in self.page_overlays:
+            overlay.clear()
+            overlay.hide()
+
+        self.selection_start_char = None
+        self.selection_end_char = None
+        self.selection_start_word = None
+        self.selection_end_word = None
+        self.current_selected_text = ""
+        self.current_page_label = None
+
+    def get_toc(self) -> list:
+        """获取目录"""
+        if self.doc:
+            return self.doc.get_toc()
+        return []
+
+    def get_annotations(self) -> list:
+        """获取注释"""
+        if not self.doc:
+            return []
+
+        annots = []
+        for page_idx in range(self.total_pages):
+            page = self.doc[page_idx]
+            page_annots = list(page.annots())
+
+            for annot in page_annots:
+                annot_type_raw = annot.type
+                if isinstance(annot_type_raw, tuple):
+                    annot_type = annot_type_raw[1] if len(annot_type_raw) > 1 else "未知"
+                    type_num = annot_type_raw[0]
+                else:
+                    type_map = {8: "高亮", 9: "下划线", 10: "删除线", 11: "波浪线",
+                               0: "文本", 12: "盖章", 14: "墨水", 15: "弹出", 16: "文件附件"}
+                    annot_type = type_map.get(annot_type_raw, f"类型{annot_type_raw}")
+                    type_num = annot_type_raw
+
+                info = annot.info
+                content = info.get("content", "") if info else ""
+
+                annots.append({
+                    "page": page_idx,
+                    "type": annot_type,
+                    "type_num": type_num,
+                    "content": content,
+                    "rect": annot.rect
+                })
+
+        return annots
+
+    def get_page_thumbnail(self, page_idx: int, zoom: float = 0.15) -> QPixmap:
+        """获取缩略图"""
+        if not self.doc or page_idx < 0 or page_idx >= self.total_pages:
+            return None
+
+        try:
+            page = self.doc[page_idx]
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+
+            img = QImage(
+                pix.samples, pix.width, pix.height, pix.stride,
+                QImage.Format_RGB888 if pix.n == 3 else QImage.Format_ARGB32
+            ).copy()
+
+            return QPixmap.fromImage(img)
+        except Exception as e:
+            print(f"缩略图失败: {e}")
+            return None
+
+
 class PDFViewer(QMainWindow):
     """主窗口类 - 实现 PDF 查看器的核心功能"""
 
@@ -378,36 +918,19 @@ class PDFViewer(QMainWindow):
         self.setWindowTitle("Unipdf - 极简 PDF 查看器")
         self.setGeometry(100, 100, 1200, 800)
 
-        # 当前文档状态
-        self.doc = None  # fitz.Document 对象
-        self.current_page = 0  # 当前页码（从 0 开始）
-        self.zoom_factor = 1.0  # 缩放因子
-        self.total_pages = 0  # 总页数
-        self.file_path = None  # 当前打开的文件路径
+        # ==================== 多标签页支持 ====================
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setTabsClosable(True)
+        self.tab_widget.setMovable(True)
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
+        self.tab_widget.tabCloseRequested.connect(self._on_tab_close_requested)
 
-        # 文本选择相关
-        self.selection_start_char = None  # 选择起始字符索引
-        self.selection_end_char = None  # 选择结束字符索引
-        self.selection_start_word = None  # 选择起始 word 索引
-        self.selection_end_word = None  # 选择结束 word 索引
-        self.current_selected_text = ""  # 当前选中的文本
-        self.page_text_chars = []  # 当前页面字符位置信息
-        self.page_words = []  # 当前页面 words 列表（用于 hit-test）
-        self.is_selecting = False  # 是否正在选择
-        self.is_ctrl_pressed = False  # Ctrl 是否按下
-        self.rubber_band = None  # 橡皮筋选择框
-        self.current_page_label = None  # 当前正在操作的页面标签
+        # 当前活动文档引用
+        self.current_doc = None
 
-        # 多页面显示
-        self.page_labels = []  # 存储所有页面标签
-        self.page_overlays = []  # 存储所有文本选择覆盖层
-        self.is_ctrl_pressed = False  # 是否按住 Ctrl 键
-        self._selection_overlay = None  # 文本选择覆盖层
-
-        # 渲染延迟定时器（用于优化性能，避免频繁渲染）
-        self.render_timer = QTimer()
-        self.render_timer.setSingleShot(True)
-        self.render_timer.timeout.connect(self._do_render)
+        # ==================== 侧边栏相关 ====================
+        self._sidebar_visible = False
+        self._sidebar_width = 250
 
         # 搜索功能相关
         self.search_results = []  # 搜索结果列表
@@ -445,23 +968,15 @@ class PDFViewer(QMainWindow):
         # 剪贴板
         self.clipboard = QApplication.clipboard()
 
-        # 侧边栏状态 - REQ-01: 默认隐藏
-        self._sidebar_visible = False
-        self._sidebar_width = 250
-
-        # ==================== 下划线注释功能 ====================
-        # 注释热区索引 {page_idx: [{"rect": fitz.Rect, "content": str}, ...]}
-        self._annot_hotspot_map = {}
-        # 当前悬停的注释
-        self._current_hover_annot = None
-        # 文档是否已修改（未保存）
-        self._document_modified = False
-        # 浮窗延时定时器
+        # 显示欢迎页
+        self._add_welcome_tab()
+        # 自定义浮窗
+        self._annot_tooltip = None
+        # 注释悬停提示计时器
         self._tooltip_timer = QTimer()
         self._tooltip_timer.setSingleShot(True)
         self._tooltip_timer.timeout.connect(self._show_annot_tooltip)
-        # 自定义浮窗
-        self._annot_tooltip = None
+        self._current_hover_annot = None
 
     def _init_ui(self):
         """初始化用户界面 - 左右分割布局"""
@@ -524,47 +1039,14 @@ class PDFViewer(QMainWindow):
 
         self.splitter.addWidget(self.sidebar_container)
 
-        # ==================== 右侧: 页面展示区域 ====================
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)  # 启用自动调整
-        self.scroll_area.setAlignment(Qt.AlignCenter)
-        self.scroll_area.setStyleSheet("QScrollArea { background-color: #666666; }")
-
-        # 创建容器部件容纳所有页面（垂直布局）
-        self.pages_container = QWidget()
-        self.pages_container.setStyleSheet("QWidget { background-color: #555555; }")
-        self.pages_layout = QVBoxLayout(self.pages_container)
-        self.pages_layout.setSpacing(10)  # 页间间距 10 像素
-        self.pages_layout.setContentsMargins(10, 10, 10, 10)  # 边距
-        self.pages_layout.setAlignment(Qt.AlignCenter)  # 居中对齐
-
-        self.scroll_area.setWidget(self.pages_container)
-
-        # 页面标签列表 - 每个页面一个 QLabel
-        self.page_labels = []  # 存储所有页面标签
-        self.page_overlays = []  # 存储所有覆盖层
-
-        self.splitter.addWidget(self.scroll_area)
+        # ==================== 右侧: 标签页区域 ====================
+        self.splitter.addWidget(self.tab_widget)
 
         # 设置分割比例（侧边栏:页面 = 1:4）
         self.splitter.setSizes([250, 950])
 
-        # 记录侧边栏宽度用于显示/隐藏
-        self._sidebar_width = 250
-
         # ==================== 菜单栏 ====================
         self._init_menu_bar()
-
-        # ==================== 鼠标事件 ====================
-        self.pages_container.setMouseTracking(True)
-        # 安装事件过滤器以捕获鼠标事件
-        self.pages_container.installEventFilter(self)
-        # 给 scroll_area 也安装事件过滤器，拦截 Ctrl+滚轮
-        self.scroll_area.installEventFilter(self)
-        # 注意：现在需要动态识别当前操作的页面
-
-        # 右键菜单 - 通过 eventFilter 处理，不使用 customContextMenuRequested 避免重复触发
-        self.pages_container.setContextMenuPolicy(Qt.NoContextMenu)
 
         # ==================== 底部搜索框（初始隐藏）====================
         self.search_widget = QWidget()
@@ -622,6 +1104,148 @@ class PDFViewer(QMainWindow):
         # REQ-01: 侧边栏初始隐藏
         self.sidebar_container.setVisible(False)
         self._sidebar_visible = False
+
+    def _add_welcome_tab(self):
+        """添加欢迎页标签"""
+        welcome = QWidget()
+        layout = QVBoxLayout(welcome)
+        layout.setAlignment(Qt.AlignCenter)
+
+        label = QLabel("<h1>Unipdf</h1><p>极简、极速的 PDF 查看器</p>"
+                      "<p>拖拽 PDF 文件到窗口或按 Ctrl+O 打开文件</p>")
+        label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(label)
+
+        self.tab_widget.addTab(welcome, "欢迎")
+        self.current_doc = None
+
+    def _on_tab_changed(self, index: int):
+        """切换标签页时更新侧边栏"""
+        if index < 0:
+            return
+
+        widget = self.tab_widget.widget(index)
+        if isinstance(widget, PDFTabDocument):
+            self.current_doc = widget
+            # 安装事件过滤器
+            widget.pages_container.installEventFilter(self)
+            widget.scroll_area.installEventFilter(self)
+            self._update_sidebar_for_current_tab()
+            self._update_window_title()
+        else:
+            self.current_doc = None
+            self.toc_widget.clear()
+            self.annot_widget.clear()
+            self.thumbnail_widget.clear()
+            self.setWindowTitle("Unipdf - 极简 PDF 查看器")
+
+    def _on_tab_close_requested(self, index: int):
+        """关闭标签页前检查未保存更改"""
+        widget = self.tab_widget.widget(index)
+
+        if isinstance(widget, PDFTabDocument) and widget.is_modified():
+            reply = QMessageBox.question(
+                self, "未保存的更改",
+                f"文件 \"{widget.get_file_name()}\" 有未保存的更改。\n是否保存？",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save
+            )
+
+            if reply == QMessageBox.Save:
+                if not widget.save_document():
+                    return
+            elif reply == QMessageBox.Cancel:
+                return
+
+        self.tab_widget.removeTab(index)
+
+        if self.tab_widget.count() == 0:
+            self._add_welcome_tab()
+
+    def _update_sidebar_for_current_tab(self):
+        """根据当前标签页更新侧边栏内容"""
+        if not self.current_doc:
+            return
+
+        doc = self.current_doc
+
+        # 更新目录
+        self.toc_widget.clear()
+        toc = doc.get_toc()
+        if toc:
+            self._populate_toc_widget(toc)
+        else:
+            item = QTreeWidgetItem(self.toc_widget)
+            item.setText(0, "(无目录)")
+            item.setData(0, Qt.UserRole, -1)
+
+        # 更新注释列表
+        self.annot_widget.clear()
+        annots = doc.get_annotations()
+        for annot in annots:
+            if annot["type_num"] in (8, 9):
+                content = annot["content"]
+                page = annot["page"]
+                annot_type = annot["type"]
+                if content:
+                    text = f"第{page+1}页 [{annot_type}] {content[:40]}"
+                    if len(content) > 40:
+                        text += "..."
+                else:
+                    text = f"第{page+1}页 [{annot_type}] (无内容)"
+                item = QListWidgetItem(text)
+                item.setData(Qt.UserRole, page)
+                item.setData(Qt.UserRole + 1, annot["rect"])
+                self.annot_widget.addItem(item)
+
+        if self.annot_widget.count() == 0:
+            item = QListWidgetItem("(文档中无注释)")
+            item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+            self.annot_widget.addItem(item)
+
+        # 更新缩略图
+        self.thumbnail_widget.clear()
+        self._load_thumbnails()
+
+        # 清除搜索结果
+        self.search_results = []
+        self.current_search_index = -1
+        self.search_results_widget.clear()
+
+    def _populate_toc_widget(self, toc: list):
+        """填充目录树控件"""
+        stack = []
+        for level, title, page_num in toc:
+            page_index = page_num - 1
+            item = QTreeWidgetItem()
+            item.setText(0, title)
+            item.setToolTip(0, title)
+            item.setData(0, Qt.UserRole, page_index)
+
+            if level == 1:
+                self.toc_widget.addTopLevelItem(item)
+                stack = [item]
+            else:
+                while len(stack) >= level:
+                    stack.pop()
+                if stack:
+                    stack[-1].addChild(item)
+                else:
+                    self.toc_widget.addTopLevelItem(item)
+                stack.append(item)
+
+        self.toc_widget.expandAll()
+
+    def _update_window_title(self):
+        """更新窗口标题"""
+        if self.current_doc and self.current_doc.file_path:
+            filename = self.current_doc.get_file_name()
+            if self.current_doc.is_modified():
+                self.setWindowTitle(f"Unipdf - {filename} *")
+            else:
+                self.setWindowTitle(f"Unipdf - {filename}")
+        else:
+            self.setWindowTitle("Unipdf - 极简 PDF 查看器")
 
     def _init_menu_bar(self):
         """初始化菜单栏"""
@@ -739,89 +1363,65 @@ class PDFViewer(QMainWindow):
 
     def open_document(self, file_path: str):
         """
-        打开指定的 PDF 文档
+        在新标签页中打开 PDF 文档
 
         Args:
             file_path: PDF 文件的完整路径
         """
-        # 检查是否有未保存的更改
-        if self._document_modified and self.file_path:
-            reply = QMessageBox.question(
-                self, "未保存的更改",
-                f"文件 \"{os.path.basename(self.file_path)}\" 有未保存的更改。\n是否保存？",
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                QMessageBox.Save
-            )
-            if reply == QMessageBox.Save:
-                if not self._save_document_safely():
-                    return  # 保存失败，取消打开
-            elif reply == QMessageBox.Cancel:
-                return  # 取消打开
-            # Discard: 继续打开新文档
+        # 检查是否已在某个标签页中打开
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            if isinstance(widget, PDFTabDocument) and widget.file_path == file_path:
+                # 切换到已存在的标签页
+                self.tab_widget.setCurrentIndex(i)
+                return
 
-        # 清除缓存强制刷新
-        self._l2_cache.clear()
-        self._base_pixmaps.clear()
-
+        # 创建新标签页
         try:
-            # 关闭现有文档
-            self._close_document()
+            new_doc = PDFTabDocument()
+            if not new_doc.open_document(file_path):
+                return  # 打开失败
 
-            # 打开新文档
-            self.doc = fitz.open(file_path)
-            self.file_path = file_path
-            self.total_pages = len(self.doc)
-            self.current_page = 0
-            self.zoom_factor = 1.0
-            self._document_modified = False  # 重置修改标记
+            # 渲染文档
+            new_doc._do_render()
 
-            # 更新窗口标题
-            self.setWindowTitle(f"Unipdf - {os.path.basename(file_path)}")
+            # 添加到标签页
+            tab_title = os.path.basename(file_path)
+            index = self.tab_widget.addTab(new_doc, tab_title)
+            self.tab_widget.setCurrentIndex(index)
+            self.current_doc = new_doc
 
-            # 加载目录
-            self._load_toc()
+            # 更新侧边栏
+            self._update_sidebar_for_current_tab()
+            self._update_window_title()
 
-            # 构建注释热区索引
-            self._build_annot_index()
-
-            # 加载注释侧边栏
-            self._load_annotations()
-
-            # 渲染第一页
-            self.render_page(self.current_page, self.zoom_factor)
-
-            # 加载缩略图
-            self._load_thumbnails()
+            # 移除欢迎页（如果存在）
+            self._remove_welcome_tab()
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"无法打开 PDF 文件:\n{str(e)}")
 
+    def _remove_welcome_tab(self):
+        """移除欢迎页标签"""
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            if not isinstance(widget, PDFTabDocument):
+                self.tab_widget.removeTab(i)
+                return
+
     def _close_document(self):
-        """关闭当前文档，释放资源"""
-        if self.doc:
-            self.doc.close()
-            self.doc = None
-
-        self.file_path = None
-        self.total_pages = 0
-        self.current_page = 0
-        self.zoom_factor = 1.0
-        self.toc_widget.clear()
-        self.thumbnail_widget.clear()
-
-        # 清除所有页面
-        self._clear_all_pages()
-
-        # 清除文本选择
-        self._clear_text_selection()
+        """关闭当前标签页的文档"""
+        current_index = self.tab_widget.currentIndex()
+        if current_index >= 0:
+            self._on_tab_close_requested(current_index)
 
         self.setWindowTitle("Unipdf - 极简 PDF 查看器")
 
     def _mark_document_modified(self, modified: bool = True):
         """标记文档修改状态并更新标题栏"""
         self._document_modified = modified
-        if self.file_path:
-            filename = os.path.basename(self.file_path)
+        if self.current_doc and self.current_doc.file_path:
+            filename = os.path.basename(self.current_doc.file_path)
             if modified:
                 self.setWindowTitle(f"Unipdf - {filename} *")
             else:
@@ -829,38 +1429,16 @@ class PDFViewer(QMainWindow):
 
     def _save_document_safely(self):
         """
-        安全保存文档（自动处理增量/完整保存）
-        - 首先尝试增量保存（保持原文件结构）
-        - 如果失败（加密、权限等问题），保存到临时文件后替换原文件
+        安全保存当前标签页的文档
         """
-        if not self.doc or not self.file_path:
-            return False
-
-        try:
-            # 首先尝试增量保存
-            self.doc.save(self.file_path, incremental=True)
-            self._mark_document_modified(False)
-            return True
-        except Exception as e:
-            error_msg = str(e).lower()
-            # 增量保存失败，尝试完整保存到临时文件后替换
-            if "incremental" in error_msg or "encryption" in error_msg:
-                try:
-                    import shutil
-                    # 保存到临时文件（与原文件同目录以确保在同一文件系统）
-                    temp_path = self.file_path + ".tmp"
-                    self.doc.save(temp_path)
-                    # 替换原文件
-                    shutil.move(temp_path, self.file_path)
-                    self._mark_document_modified(False)
-                    return True
-                except Exception:
-                    return False
-            return False
+        if self.current_doc:
+            return self.current_doc.save_document()
+        return False
 
     def _save_document(self):
-        """保存文档（菜单触发）"""
+        """保存当前标签页的文档（菜单触发）"""
         if self._save_document_safely():
+            self._update_window_title()
             self.statusBar().showMessage("已保存", 2000)
         else:
             QMessageBox.critical(self, "错误", "保存失败")
@@ -882,10 +1460,10 @@ class PDFViewer(QMainWindow):
             }
         """)
 
-        if not self.doc:
+        if not self.current_doc or not self.current_doc.doc:
             return
 
-        toc = self.doc.get_toc()  # 获取目录列表 [level, title, page]
+        toc = self.current_doc.doc.get_toc()  # 获取目录列表 [level, title, page]
 
         if not toc:
             item = QTreeWidgetItem(self.toc_widget)
@@ -929,8 +1507,13 @@ class PDFViewer(QMainWindow):
     def _on_toc_clicked(self, item: QTreeWidgetItem):
         """目录点击事件 - 跳转到对应页面"""
         page_index = item.data(0, Qt.UserRole)
-        if page_index >= 0 and page_index < self.total_pages:
-            self._scroll_to_page(page_index)
+        if self.current_doc and page_index >= 0:
+            if page_index < self.current_doc.total_pages:
+                self.current_doc.go_to_page(page_index)
+                # 滚动到页面
+                if page_index < len(self.current_doc.page_labels):
+                    page_label = self.current_doc.page_labels[page_index]
+                    self.current_doc.scroll_area.ensureWidgetVisible(page_label, 50, 50)
 
     # ==================== 页面渲染（核心功能） ====================
 
@@ -946,7 +1529,7 @@ class PDFViewer(QMainWindow):
             - 使用延迟渲染机制，避免频繁操作时的性能问题
             - 通过设置矩阵（Matrix）实现高质量缩放
         """
-        if not self.doc or index < 0 or index >= self.total_pages:
+        if not self.current_doc or not self.current_doc.doc or index < 0 or index >= self.current_doc.total_pages:
             return
 
         # 保存当前要渲染的参数
@@ -959,14 +1542,14 @@ class PDFViewer(QMainWindow):
 
     def _do_render(self):
         """P0/P2: 执行实际渲染操作 - 使用多级缓存"""
-        if not self.doc:
+        if not self.current_doc or not self.current_doc.doc:
             return
 
         # 取消任何正在进行的异步渲染
         self._cancel_active_workers()
 
         try:
-            zoom = self.zoom_factor
+            zoom = self.current_doc.zoom_factor
             zoom_percent = int(zoom * 100)
 
             # 获取 DPI 缩放因子（与坐标转换保持一致）
@@ -984,13 +1567,13 @@ class PDFViewer(QMainWindow):
             l2_cache = self._l2_cache.get(zoom_percent, {})
 
             # 渲染所有页面
-            for page_idx in range(self.total_pages):
+            for page_idx in range(self.current_doc.total_pages):
                 # P2: 优先使用 L2 缓存
                 if page_idx in l2_cache:
                     qpixmap = l2_cache[page_idx]
                     self._base_pixmaps[page_idx] = qpixmap
                 else:
-                    page = self.doc[page_idx]
+                    page = self.current_doc.doc[page_idx]
 
                     # 创建缩放矩阵（包含 DPI scale，与坐标转换一致）
                     mat = fitz.Matrix(zoom * dpi_scale, zoom * dpi_scale)
@@ -1040,7 +1623,7 @@ class PDFViewer(QMainWindow):
 
                 # 存储页面信息
                 page_label.page_index = page_idx  # 存储页码
-                self.page_labels.append(page_label)
+                self.current_doc.page_labels.append(page_label)
                 self.page_overlays.append(overlay)
 
                 # 安装事件过滤器以支持悬停检测
@@ -1054,7 +1637,7 @@ class PDFViewer(QMainWindow):
             self.pages_layout.addStretch()
 
             # 更新状态栏
-            self.statusBar().showMessage(f"共 {self.total_pages} 页 | 缩放: {zoom * 100:.0f}%")
+            self.statusBar().showMessage(f"共 {self.current_doc.total_pages} 页 | 缩放: {zoom * 100:.0f}%")
 
             # 清除文本选择
             self._clear_text_selection()
@@ -1070,14 +1653,17 @@ class PDFViewer(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
 
-        self.page_labels.clear()
+        self.current_doc.page_labels.clear()
         self.page_overlays.clear()
 
     def _get_page_at_pos(self, pos: QPoint) -> tuple:
         """获取指定位置对应的页面标签和页码"""
-        for i, page_label in enumerate(self.page_labels):
+        if not self.current_doc:
+            return None, -1, None
+
+        for i, page_label in enumerate(self.current_doc.page_labels):
             # 获取页面标签在容器中的全局位置
-            label_pos = page_label.mapFrom(self.pages_container, pos)
+            label_pos = page_label.mapFrom(self.current_doc.pages_container, pos)
             if page_label.rect().contains(label_pos):
                 return page_label, i, label_pos
         return None, -1, None
@@ -1086,49 +1672,45 @@ class PDFViewer(QMainWindow):
 
     def _prev_page(self):
         """翻到上一页"""
-        if self.current_page > 0:
-            self.current_page -= 1
-            self.render_page(self.current_page, self.zoom_factor)
+        if self.current_doc:
+            self.current_doc.prev_page()
 
     def _next_page(self):
         """翻到下一页"""
-        if self.current_page < self.total_pages - 1:
-            self.current_page += 1
-            self.render_page(self.current_page, self.zoom_factor)
+        if self.current_doc:
+            self.current_doc.next_page()
 
     # ==================== 缩放功能 ====================
 
     def _zoom(self, factor: float):
         """
         P0: 按比例缩放页面 - 即时拉伸 + 异步高清渲染
-
-        Args:
-            factor: 缩放倍数，例如 1.1 表示放大 10%，0.9 表示缩小 10%
         """
-        if not self.doc:
+        if not self.current_doc:
             return
 
-        new_zoom = self.zoom_factor * factor
-
-        # 限制缩放范围（10% - 500%）
-        new_zoom = max(0.1, min(5.0, new_zoom))
-
-        if abs(new_zoom - self._target_zoom) < 0.01:
-            return  # 缩放变化太小，忽略
-
-        self._target_zoom = new_zoom
-
-        # P0: 即时视觉反馈 - 使用 QPainter 拉伸当前图像
-        self._apply_zoom_preview(factor)
-
-        # P0: 防抖处理 - 停止之前的定时器
-        self._zoom_timer.stop()
-        # 150ms 后执行高清渲染
-        self._zoom_timer.start(150)
+        self.current_doc.zoom(factor)
 
     def _apply_zoom_preview(self, factor: float):
-        """P3: 即时缩放预览 - 使用 L2 缓存的最近级别进行图像插值"""
-        if not self.page_labels:
+        """已移至 PDFTabDocument"""
+        pass  # 现在由 PDFTabDocument 处理
+
+    def _find_nearest_zoom_step(self, zoom_percent: int) -> int:
+        """P3: 找到最接近的关键缩放级别"""
+        if not hasattr(self, '_zoom_steps') or not self._zoom_steps:
+            return 100
+
+        nearest = self._zoom_steps[0]
+        min_diff = abs(zoom_percent - nearest)
+
+        for step in self._zoom_steps[1:]:
+            diff = abs(zoom_percent - step)
+            if diff < min_diff:
+                min_diff = diff
+                nearest = step
+
+        return nearest
+        if not self.current_doc.page_labels:
             return
 
         target_zoom_percent = int(self._target_zoom * 100)
@@ -1136,7 +1718,7 @@ class PDFViewer(QMainWindow):
         # 找到最接近的关键缩放级别
         nearest_zoom = self._find_nearest_zoom_step(target_zoom_percent)
 
-        for i, page_label in enumerate(self.page_labels):
+        for i, page_label in enumerate(self.current_doc.page_labels):
             # 获取当前显示的大小
             current_size = page_label.size()
 
@@ -1159,7 +1741,7 @@ class PDFViewer(QMainWindow):
             # 3. 回退到当前基础图像
             elif i in self._base_pixmaps:
                 source_pixmap = self._base_pixmaps[i]
-                source_zoom = int(self.zoom_factor * 100)
+                source_zoom = int(self.current_doc.zoom_factor * 100)
 
             if source_pixmap:
                 # 计算需要从源缩放级别到目标缩放级别的比例
@@ -1193,7 +1775,7 @@ class PDFViewer(QMainWindow):
                     self.page_overlays[i].resize(page_label.size())
 
         # 更新状态栏显示目标缩放比例
-        self.statusBar().showMessage(f"共 {self.total_pages} 页 | 缩放: {self._target_zoom * 100:.0f}% (渲染中...)")
+        self.statusBar().showMessage(f"共 {self.current_doc.total_pages} 页 | 缩放: {self._target_zoom * 100:.0f}% (渲染中...)")
 
     def _find_nearest_zoom_step(self, zoom_percent: int) -> int:
         """P3: 找到最接近的关键缩放级别"""
@@ -1214,7 +1796,7 @@ class PDFViewer(QMainWindow):
 
     def _do_hd_render(self):
         """P3: 防抖后执行高清异步渲染 - 只渲染到最接近的关键级别"""
-        if not self.doc or abs(self._target_zoom - self.zoom_factor) < 0.01:
+        if not self.current_doc or not self.current_doc.doc or abs(self._target_zoom - self.current_doc.zoom_factor) < 0.01:
             return
 
         # P3: 找到最接近的关键缩放级别
@@ -1231,20 +1813,20 @@ class PDFViewer(QMainWindow):
 
     def _do_render_at_zoom(self, zoom: float):
         """P3: 在指定缩放级别执行渲染"""
-        old_zoom = self.zoom_factor
-        self.zoom_factor = zoom
+        old_zoom = self.current_doc.zoom_factor
+        self.current_doc.zoom_factor = zoom
         zoom_percent = int(zoom * 100)
 
         # 清除 UI 矩形缓存（zoom 改变后需要重新计算）
-        if hasattr(self, 'page_words') and self.page_words:
-            for w in self.page_words:
+        if hasattr(self.current_doc, 'page_words') and self.current_doc.page_words:
+            for w in self.current_doc.page_words:
                 if "ui_rect" in w:
                     del w["ui_rect"]
 
         # P3: 如果该缩放级别已在 L2 缓存中，直接使用
         if zoom_percent in self._l2_cache:
             cached_pages = self._l2_cache[zoom_percent]
-            if len(cached_pages) == self.total_pages:
+            if len(cached_pages) == self.current_doc.total_pages:
                 # 完全缓存命中，直接显示
                 self._display_from_l2_cache(zoom_percent)
                 return
@@ -1260,15 +1842,15 @@ class PDFViewer(QMainWindow):
         cached_pages = self._l2_cache[zoom_percent]
         target_size = None
 
-        for page_idx in range(self.total_pages):
+        for page_idx in range(self.current_doc.total_pages):
             if page_idx not in cached_pages:
                 continue
 
             pixmap = cached_pages[page_idx]
-            if page_idx >= len(self.page_labels):
+            if page_idx >= len(self.current_doc.page_labels):
                 continue
 
-            page_label = self.page_labels[page_idx]
+            page_label = self.current_doc.page_labels[page_idx]
             page_label.setPixmap(pixmap)
             page_label.setFixedSize(pixmap.size())
             self._base_pixmaps[page_idx] = pixmap
@@ -1280,14 +1862,14 @@ class PDFViewer(QMainWindow):
                 target_size = pixmap.size()
 
         # 更新状态栏
-        self.statusBar().showMessage(f"共 {self.total_pages} 页 | 缩放: {zoom_percent}%")
+        self.statusBar().showMessage(f"共 {self.current_doc.total_pages} 页 | 缩放: {zoom_percent}%")
 
     def _start_async_render(self):
         """P0/P1/P2: 启动异步渲染任务 - 支持视口裁剪和多级缓存"""
         # 取消正在进行的渲染任务
         self._cancel_active_workers()
 
-        if not self.file_path:
+        if not self.current_doc or not self.current_doc.file_path:
             return
 
         # 获取显示参数
@@ -1301,17 +1883,17 @@ class PDFViewer(QMainWindow):
         scroll_y = self.scroll_area.verticalScrollBar().value()
 
         # P2: 检查 L2 缓存是否有所需缩放级别
-        zoom_percent = int(self.zoom_factor * 100)
+        zoom_percent = int(self.current_doc.zoom_factor * 100)
         cached_pages = self._l2_cache.get(zoom_percent, {})
 
         # 为每个页面启动渲染任务
-        for page_idx in range(self.total_pages):
+        for page_idx in range(self.current_doc.total_pages):
             # P2: 检查缓存
             if page_idx in cached_pages:
                 # 使用 L2 缓存，直接更新显示
                 pixmap = cached_pages[page_idx]
-                if page_idx < len(self.page_labels):
-                    page_label = self.page_labels[page_idx]
+                if page_idx < len(self.current_doc.page_labels):
+                    page_label = self.current_doc.page_labels[page_idx]
                     page_label.setPixmap(pixmap)
                     page_label.setFixedSize(pixmap.size())
                     self._base_pixmaps[page_idx] = pixmap
@@ -1321,8 +1903,8 @@ class PDFViewer(QMainWindow):
 
             # P1: 计算该页面在视口中的可见区域
             clip_rect = None
-            if page_idx < len(self.page_labels) and self.zoom_factor > 2.0:
-                page_label = self.page_labels[page_idx]
+            if page_idx < len(self.current_doc.page_labels) and self.current_doc.zoom_factor > 2.0:
+                page_label = self.current_doc.page_labels[page_idx]
                 page_pos = page_label.pos()
                 page_size = page_label.size()
 
@@ -1353,9 +1935,9 @@ class PDFViewer(QMainWindow):
                         )
 
             worker = RenderWorker(
-                self.file_path,
+                self.current_doc.file_path,
                 page_idx,
-                self.zoom_factor,
+                self.current_doc.zoom_factor,
                 dpi_scale,
                 device_ratio,
                 clip_rect=clip_rect,
@@ -1386,13 +1968,13 @@ class PDFViewer(QMainWindow):
                 clip_rect = worker.clip_rect
 
         # 检查缩放级别是否仍然匹配
-        current_zoom_percent = int(self.zoom_factor * 100)
+        current_zoom_percent = int(self.current_doc.zoom_factor * 100)
         if zoom_percent != current_zoom_percent:
             return  # 缩放已改变，丢弃此结果
 
         # 更新页面显示
-        if page_idx < len(self.page_labels):
-            page_label = self.page_labels[page_idx]
+        if page_idx < len(self.current_doc.page_labels):
+            page_label = self.current_doc.page_labels[page_idx]
 
             if is_clipped and clip_rect and page_idx in self._base_pixmaps:
                 # P1: 裁剪渲染 - 将新图像合成到基础图像上
@@ -1421,7 +2003,7 @@ class PDFViewer(QMainWindow):
 
         # 更新状态栏
         if not self._active_workers:
-            self.statusBar().showMessage(f"共 {self.total_pages} 页 | 缩放: {self.zoom_factor * 100:.0f}%")
+            self.statusBar().showMessage(f"共 {self.current_doc.total_pages} 页 | 缩放: {self.current_doc.zoom_factor * 100:.0f}%")
 
     def _add_to_l2_cache(self, page_idx: int, zoom_percent: int, pixmap: QPixmap):
         """P3: 添加渲染结果到 L2 缓存 - 只缓存关键缩放级别"""
@@ -1449,21 +2031,10 @@ class PDFViewer(QMainWindow):
             del self._active_workers[page_idx]
 
     def _zoom_reset(self):
-        """P0: 重置缩放为 100% - 使用异步渲染"""
-        if not self.doc:
-            return
-
-        self._target_zoom = 1.0
-        self.zoom_factor = 1.0
-
-        # 清除 UI 矩形缓存
-        if hasattr(self, 'page_words') and self.page_words:
-            for w in self.page_words:
-                if "ui_rect" in w:
-                    del w["ui_rect"]
-
-        # 启动异步渲染
-        self._start_async_render()
+        """P0: 重置缩放为 100%"""
+        if self.current_doc:
+            self.current_doc.zoom_reset()
+            self._update_window_title()
 
     # ==================== 鼠标滚轮事件（缩放） ====================
 
@@ -1474,7 +2045,7 @@ class PDFViewer(QMainWindow):
         Ctrl + 滚轮: 缩放页面（阻止页面滚动）
         普通滚轮: 翻页或滚动
         """
-        if not self.doc:
+        if not self.current_doc:
             event.ignore()
             return
 
@@ -1493,50 +2064,50 @@ class PDFViewer(QMainWindow):
             event.accept()
             return
 
-        # 普通滚轮 - 让 QScrollArea 处理
+        # 普通滚轮 - 让基类处理
         super().wheelEvent(event)
 
     def eventFilter(self, obj, event):
         """事件过滤器 - 处理 pages_container 和 scroll_area 的事件"""
+        if not self.current_doc:
+            return super().eventFilter(obj, event)
+
+        doc = self.current_doc
+        pages_container = doc.pages_container
+        scroll_area = doc.scroll_area
+
         # 双击主页面隐藏搜索框
         if event.type() == event.MouseButtonDblClick:
-            # 检查是否点击在主页面区域
-            if obj in [self.pages_container, self.scroll_area] or \
-               (hasattr(obj, 'parent') and obj.parent() == self.pages_container):
+            if obj in [pages_container, scroll_area] or \
+               (hasattr(obj, 'parent') and obj.parent() == pages_container):
                 self._hide_search_widget()
-                # 不拦截事件，让其他处理继续
 
         # 处理滚轮事件：Ctrl+滚轮时阻止滚动并执行缩放
         if event.type() == event.Wheel:
             if event.modifiers() & Qt.ControlModifier:
-                # Ctrl+滚轮：直接处理缩放
                 delta = event.angleDelta().y()
                 if delta > 0:
                     self._zoom(1.1)
                 elif delta < 0:
                     self._zoom(0.9)
                 event.accept()
-                return True  # 拦截事件，阻止 scroll_area 滚动
+                return True
 
         # 处理 pages_container 或其子控件（page_labels）的鼠标事件
         is_page_label = hasattr(obj, 'page_index')
-        if (obj == self.pages_container or is_page_label) and self.doc:
+        if (obj == pages_container or is_page_label) and doc.doc:
             if event.type() == event.MouseButtonPress:
                 if event.button() == Qt.RightButton:
-                    # 处理右键点击
                     pos = event.pos()
                     if is_page_label:
-                        # 转换坐标到 pages_container
                         global_pos = obj.mapToGlobal(pos)
-                        pos = self.pages_container.mapFromGlobal(global_pos)
+                        pos = pages_container.mapFromGlobal(global_pos)
                     self._show_context_menu(pos)
                 else:
-                    # 处理左键点击 - 确保坐标在 pages_container 坐标系
                     if is_page_label:
                         pos = event.pos()
                         global_pos = obj.mapToGlobal(pos)
-                        new_pos = self.pages_container.mapFromGlobal(global_pos)
-                        # 创建新的事件对象（使用转换后的坐标）
+                        new_pos = pages_container.mapFromGlobal(global_pos)
                         new_event = QMouseEvent(
                             event.type(), new_pos, event.button(),
                             event.buttons(), event.modifiers()
@@ -1546,11 +2117,10 @@ class PDFViewer(QMainWindow):
                         self._on_mouse_press(event)
                 return True
             elif event.type() == event.MouseMove:
-                # 处理鼠标移动 - 确保坐标在 pages_container 坐标系
                 if is_page_label:
                     pos = event.pos()
                     global_pos = obj.mapToGlobal(pos)
-                    new_pos = self.pages_container.mapFromGlobal(global_pos)
+                    new_pos = pages_container.mapFromGlobal(global_pos)
                     new_event = QMouseEvent(
                         event.type(), new_pos, event.button(),
                         event.buttons(), event.modifiers()
@@ -1560,11 +2130,10 @@ class PDFViewer(QMainWindow):
                     self._on_mouse_move(event)
                 return True
             elif event.type() == event.MouseButtonRelease:
-                # 处理鼠标释放 - 确保坐标在 pages_container 坐标系
                 if is_page_label:
                     pos = event.pos()
                     global_pos = obj.mapToGlobal(pos)
-                    new_pos = self.pages_container.mapFromGlobal(global_pos)
+                    new_pos = pages_container.mapFromGlobal(global_pos)
                     new_event = QMouseEvent(
                         event.type(), new_pos, event.button(),
                         event.buttons(), event.modifiers()
@@ -1603,10 +2172,6 @@ class PDFViewer(QMainWindow):
                 event.accept()
                 return
 
-        if not self.doc:
-            super().keyPressEvent(event)
-            return
-
         key = event.key()
         modifiers = event.modifiers()
 
@@ -1629,15 +2194,14 @@ class PDFViewer(QMainWindow):
                 return
 
             elif key == Qt.Key_Home:
-                self.current_page = 0
-                self.render_page(self.current_page, self.zoom_factor)
+                if self.current_doc:
+                    self.current_doc.go_to_page(0)
                 event.accept()
                 return
 
             elif key == Qt.Key_End:
-                if self.total_pages > 0:
-                    self.current_page = self.total_pages - 1
-                    self.render_page(self.current_page, self.zoom_factor)
+                if self.current_doc and self.current_doc.total_pages > 0:
+                    self.current_doc.go_to_page(self.current_doc.total_pages - 1)
                 event.accept()
                 return
 
@@ -1658,6 +2222,9 @@ class PDFViewer(QMainWindow):
                 event.accept()
                 return
 
+        # 如果没有处理的按键，交给父类
+        super().keyPressEvent(event)
+
         # 未处理的按键交给父类
         super().keyPressEvent(event)
 
@@ -1665,8 +2232,10 @@ class PDFViewer(QMainWindow):
 
     def _compute_page_transform(self, page_label):
         """集中计算坐标变换参数（正确处理 DPI 和 devicePixelRatio）"""
-        if not page_label or not self.doc:
+        if not page_label or not self.current_doc:
             return None
+
+        doc = self.current_doc
 
         # DPI 缩放（逻辑像素 scale）
         dpi_scale = page_label.logicalDpiX() / 96.0
@@ -1676,7 +2245,6 @@ class PDFViewer(QMainWindow):
             return None
 
         # 由于设置了 setDevicePixelRatio，pixmap.size() 返回的是逻辑尺寸
-        # 但 pixmap.width() 返回的是设备像素，所以需要转换
         pixmap_logical_w = pixmap.width() / pixmap.devicePixelRatio()
         pixmap_logical_h = pixmap.height() / pixmap.devicePixelRatio()
 
@@ -1689,8 +2257,7 @@ class PDFViewer(QMainWindow):
         offset_y = max(0.0, offset_y)
 
         # 统一的 scale：zoom * dpi_scale
-        # 这与渲染时使用的 mat = fitz.Matrix(zoom * dpi_scale, zoom * dpi_scale) 一致
-        scale = float(self.zoom_factor) * float(dpi_scale)
+        scale = float(doc.zoom_factor) * float(dpi_scale)
 
         return {
             "scale": scale,
@@ -1702,9 +2269,10 @@ class PDFViewer(QMainWindow):
 
     def _update_words_ui_rect(self, page_label):
         """预计算所有 word 的 UI 矩形，加速 hit-test"""
-        if not self.page_words or not page_label:
+        if not self.current_doc or not self.current_doc.page_words or not page_label:
             return
 
+        doc = self.current_doc
         t = self._compute_page_transform(page_label)
         if not t:
             return
@@ -1714,9 +2282,9 @@ class PDFViewer(QMainWindow):
         oy = t["offset_y"]
         contents = t["contents"]
 
-        for w in self.page_words:
+        for w in doc.page_words:
             x0, y0, x1, y1 = w["bbox"]
-            # PDF -> UI 坐标转换（PyMuPDF 原点在左上角，Y轴向下，不需要翻转）
+            # PDF -> UI 坐标转换
             ui_x0 = x0 * scale + contents.left() + ox
             ui_y0 = y0 * scale + contents.top() + oy
             ui_x1 = x1 * scale + contents.left() + ox
@@ -1727,23 +2295,25 @@ class PDFViewer(QMainWindow):
 
     def _load_page_text_chars(self, page_idx: int = None):
         """加载指定页面的字符位置信息 - 字符级精度"""
-        self.page_text_chars = []  # 字符级信息列表
-        self.page_words = []  # 词级别信息（备用）
-        if not self.doc:
+        if not self.current_doc:
             return
 
+        doc = self.current_doc
+        doc.page_text_chars = []
+        doc.page_words = []
+
         if page_idx is None:
-            page_idx = self.current_page
+            page_idx = doc.current_page
 
         try:
-            page = self.doc[page_idx]
+            page = doc.doc[page_idx]
 
             # 使用 rawdict 获取最细粒度的字符信息
             text_dict = page.get_text("rawdict")
-            char_idx = 0  # 全局字符索引
+            char_idx = 0
 
             for block in text_dict.get("blocks", []):
-                if block.get("type") != 0:  # 跳过非文本块
+                if block.get("type") != 0:
                     continue
                 for line in block.get("lines", []):
                     for span in line.get("spans", []):
@@ -1751,13 +2321,12 @@ class PDFViewer(QMainWindow):
                         chars = span.get("chars", [])
                         origin = span.get("origin", [0, 0])
 
-                        # 如果 rawdict 提供了字符级 bbox，使用它
                         if chars:
                             for char_info in chars:
                                 c = char_info.get("c", "")
                                 bbox = char_info.get("bbox", [0, 0, 0, 0])
-                                if c.strip() or c == " ":  # 包括空格
-                                    self.page_text_chars.append({
+                                if c.strip() or c == " ":
+                                    doc.page_text_chars.append({
                                         "char": c,
                                         "bbox": bbox,
                                         "span_origin": origin,
@@ -1766,7 +2335,6 @@ class PDFViewer(QMainWindow):
                                     })
                                     char_idx += 1
                         else:
-                            # 如果没有字符级信息，按字符分割 span
                             bbox = span.get("bbox", [0, 0, 0, 0])
                             x0, y0, x1, y1 = bbox
                             char_width = (x1 - x0) / max(1, len(text))
@@ -1779,7 +2347,7 @@ class PDFViewer(QMainWindow):
                                         x0 + (i + 1) * char_width,
                                         y1
                                     ]
-                                    self.page_text_chars.append({
+                                    doc.page_text_chars.append({
                                         "char": c,
                                         "bbox": char_bbox,
                                         "span_origin": origin,
@@ -1788,29 +2356,30 @@ class PDFViewer(QMainWindow):
                                     })
                                     char_idx += 1
 
-            # 同时加载词级别信息（用于双击选择等场景）
+            # 同时加载词级别信息
             words = page.get_text("words")
             for word in words:
                 x0, y0, x1, y1, text = word[0:5]
-                self.page_words.append({
+                doc.page_words.append({
                     "bbox": [x0, y0, x1, y1],
                     "text": text,
                     "rect": fitz.Rect(x0, y0, x1, y1)
                 })
 
             # 预计算字符的 UI 矩形
-            if hasattr(self, 'current_page_label') and self.current_page_label:
-                self._update_chars_ui_rect(self.current_page_label)
-                self._update_words_ui_rect(self.current_page_label)
+            if hasattr(doc, 'current_page_label') and doc.current_page_label:
+                self._update_chars_ui_rect(doc.current_page_label)
+                self._update_words_ui_rect(doc.current_page_label)
 
         except Exception as e:
             print(f"加载页面文本失败: {e}")
 
     def _update_chars_ui_rect(self, page_label):
         """预计算所有字符的 UI 矩形"""
-        if not self.page_text_chars or not page_label:
+        if not self.current_doc or not self.current_doc.page_text_chars or not page_label:
             return
 
+        doc = self.current_doc
         t = self._compute_page_transform(page_label)
         if not t:
             return
@@ -1821,7 +2390,7 @@ class PDFViewer(QMainWindow):
         contents = t["contents"]
 
         from PyQt5.QtCore import QRectF
-        for char_info in self.page_text_chars:
+        for char_info in doc.page_text_chars:
             x0, y0, x1, y1 = char_info["bbox"]
             ui_x0 = x0 * scale + contents.left() + ox
             ui_y0 = y0 * scale + contents.top() + oy
@@ -1850,23 +2419,23 @@ class PDFViewer(QMainWindow):
 
     def _get_word_at_point(self, pdf_point: tuple, ui_point: tuple = None) -> int:
         """获取点处的 word 索引，优先使用 UI 矩形"""
-        if not self.page_words:
+        if not self.current_doc or not self.current_doc.page_words:
             return -1
 
+        doc = self.current_doc
         eps = 0.5  # PDF 单位容差
 
-        # 优先使用 UI 矩形（更精确、更快）
+        # 优先使用 UI 矩形
         if ui_point is not None:
             ux, uy = ui_point
-            for i, w in enumerate(self.page_words):
+            for i, w in enumerate(doc.page_words):
                 r = w.get("ui_rect")
-                # QRectF.contains 接受 float 坐标
                 if r is not None and r.contains(float(ux), float(uy)):
                     return i
 
         # 回退到 PDF 空间
         px, py = pdf_point
-        for i, w in enumerate(self.page_words):
+        for i, w in enumerate(doc.page_words):
             x0, y0, x1, y1 = w["bbox"]
             if (x0 - eps) <= px <= (x1 + eps) and (y0 - eps) <= py <= (y1 + eps):
                 return i
@@ -1874,7 +2443,7 @@ class PDFViewer(QMainWindow):
         # 回退：找最近的
         best_i = -1
         best_d2 = None
-        for i, w in enumerate(self.page_words):
+        for i, w in enumerate(doc.page_words):
             x0, y0, x1, y1 = w["bbox"]
             cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
             d2 = (cx - px) ** 2 + (cy - py) ** 2
@@ -1885,22 +2454,24 @@ class PDFViewer(QMainWindow):
 
     def _get_char_at_point(self, pdf_point: tuple, ui_point: tuple = None) -> int:
         """获取坐标处的字符索引 - 字符级精度"""
-        if not self.page_text_chars:
+        if not self.current_doc or not self.current_doc.page_text_chars:
             return -1
 
-        # 优先使用 UI 矩形（更精确）
+        doc = self.current_doc
+
+        # 优先使用 UI 矩形
         if ui_point is not None:
             ux, uy = ui_point
-            for i, char_info in enumerate(self.page_text_chars):
+            for i, char_info in enumerate(doc.page_text_chars):
                 r = char_info.get("ui_rect")
                 if r is not None and r.contains(float(ux), float(uy)):
                     return i
 
         # 回退到 PDF 空间检测
         px, py = pdf_point
-        eps = 0.5  # 容差
+        eps = 0.5
 
-        for i, char_info in enumerate(self.page_text_chars):
+        for i, char_info in enumerate(doc.page_text_chars):
             x0, y0, x1, y1 = char_info["bbox"]
             if (x0 - eps) <= px <= (x1 + eps) and (y0 - eps) <= py <= (y1 + eps):
                 return i
@@ -1908,7 +2479,7 @@ class PDFViewer(QMainWindow):
         # 找最近的字符
         best_i = -1
         best_d = float('inf')
-        for i, char_info in enumerate(self.page_text_chars):
+        for i, char_info in enumerate(doc.page_text_chars):
             x0, y0, x1, y1 = char_info["bbox"]
             cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
             d = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
@@ -1920,17 +2491,22 @@ class PDFViewer(QMainWindow):
 
     def _get_selected_text(self, start_idx: int, end_idx: int) -> str:
         """获取从 start_idx 到 end_idx 的选中文本 - 字符级精度"""
+        if not self.current_doc:
+            return ""
+
+        doc = self.current_doc
+
         # 边界检查
         if start_idx > end_idx:
             start_idx, end_idx = end_idx, start_idx
 
         # 使用字符级信息
-        if not self.page_text_chars:
+        if not doc.page_text_chars:
             return ""
 
         # 确保索引在有效范围内
         start_idx = max(0, start_idx)
-        end_idx = min(end_idx, len(self.page_text_chars) - 1)
+        end_idx = min(end_idx, len(doc.page_text_chars) - 1)
 
         if start_idx > end_idx:
             return ""
@@ -1938,20 +2514,22 @@ class PDFViewer(QMainWindow):
         # 直接拼接字符
         chars = []
         for i in range(start_idx, end_idx + 1):
-            char_info = self.page_text_chars[i]
+            char_info = doc.page_text_chars[i]
             chars.append(char_info["char"])
 
         return "".join(chars)
 
     def _update_text_selection(self):
         """更新文本选择显示"""
-        if not self.current_page_label:
+        if not self.current_doc or not self.current_doc.current_page_label:
             return
+
+        doc = self.current_doc
 
         # 获取当前页面的覆盖层
         overlay = None
-        if self.current_page < len(self.page_overlays):
-            overlay = self.page_overlays[self.current_page]
+        if doc.current_page < len(doc.page_overlays):
+            overlay = doc.page_overlays[doc.current_page]
 
         if overlay is None:
             return
@@ -1959,33 +2537,35 @@ class PDFViewer(QMainWindow):
         # 清除之前的选择
         overlay.clear()
 
-        if self.selection_start_char is None or self.selection_end_char is None:
+        if doc.selection_start_char is None or doc.selection_end_char is None:
             return
 
-        start_idx = min(self.selection_start_char, self.selection_end_char)
-        end_idx = max(self.selection_start_char, self.selection_end_char)
+        start_idx = min(doc.selection_start_char, doc.selection_end_char)
+        end_idx = max(doc.selection_start_char, doc.selection_end_char)
 
         # 获取选中的文本
-        self.current_selected_text = self._get_selected_text(start_idx, end_idx)
+        doc.current_selected_text = self._get_selected_text(start_idx, end_idx)
 
         # 绘制选择高亮
         self._draw_selection_highlight(start_idx, end_idx, overlay)
 
     def _draw_selection_highlight(self, start_idx: int, end_idx: int, overlay: QLabel):
         """绘制文本选择高亮 - 字符级精度，合并同一行连续字符"""
-        if not self.current_page_label:
+        if not self.current_doc or not self.current_doc.current_page_label:
             return
 
+        doc = self.current_doc
+
         # 使用字符级信息
-        chars_list = self.page_text_chars
-        if not chars_list or not self.doc:
+        chars_list = doc.page_text_chars
+        if not chars_list or not doc.doc:
             return
 
         # 边界保护
         start_idx = max(0, min(start_idx, len(chars_list) - 1))
         end_idx = max(0, min(end_idx, len(chars_list) - 1))
 
-        page_label = self.current_page_label
+        page_label = doc.current_page_label
 
         # 创建透明 pixmap
         overlay_pixmap = QPixmap(page_label.size())
@@ -2093,23 +2673,27 @@ class PDFViewer(QMainWindow):
 
     def _clear_text_selection(self):
         """清除文本选择"""
+        if not self.current_doc:
+            return
+
+        doc = self.current_doc
         # 清除所有覆盖层
-        for overlay in self.page_overlays:
+        for overlay in doc.page_overlays:
             overlay.clear()
             overlay.hide()
-        self.selection_start_char = None
-        self.selection_end_char = None
-        self.selection_start_word = None
-        self.selection_end_word = None
-        self.current_selected_text = ""
-        self.current_page_label = None
+        doc.selection_start_char = None
+        doc.selection_end_char = None
+        doc.selection_start_word = None
+        doc.selection_end_word = None
+        doc.current_selected_text = ""
+        doc.current_page_label = None
 
     def _on_mouse_press(self, event):
         """鼠标按下 - 开始文本选择"""
-        if not self.doc or event.button() != Qt.LeftButton:
+        if not self.current_doc or event.button() != Qt.LeftButton:
             return
 
-        # 获取点击位置相对于 pages_container
+        doc = self.current_doc
         pos = event.pos()
 
         # 识别当前操作的页面
@@ -2117,92 +2701,94 @@ class PDFViewer(QMainWindow):
         if page_label is None:
             return
 
-        self.current_page_label = page_label
-        self.current_page = page_idx
+        doc.current_page_label = page_label
+        doc.current_page = page_idx
 
         # 检查是否按住 Ctrl 键
-        self.is_ctrl_pressed = (event.modifiers() & Qt.ControlModifier) != 0
+        doc.is_ctrl_pressed = (event.modifiers() & Qt.ControlModifier) != 0
 
         # 加载页面文本信息
         self._load_page_text_chars(page_idx)
 
-        if not self.page_text_chars:
+        if not doc.page_text_chars:
             # 没有文本可选择的页面，使用区域选择模式
             self._start_region_selection(local_pos)
             return
 
         # 文本选择模式 - 字符级精度选择
-        self.is_selecting = True
+        doc.is_selecting = True
         pdf_point = self._screen_to_pdf_point(page_label, local_pos)
-        # 优先使用字符级 hit-test
         char_idx = self._get_char_at_point(pdf_point, (local_pos.x(), local_pos.y()))
         if char_idx < 0:
-            # 如果字符级没命中，尝试词级别
             char_idx = self._get_word_at_point(pdf_point, (local_pos.x(), local_pos.y()))
 
-        self.selection_start_char = char_idx
-        self.selection_end_char = char_idx
+        doc.selection_start_char = char_idx
+        doc.selection_end_char = char_idx
         self._update_text_selection()
 
     def _start_region_selection(self, pos: QPoint):
         """开始区域选择模式（用于扫描图片页面）"""
-        self.selection_start = pos
+        if not self.current_doc:
+            return
 
-        if self.rubber_band is None:
-            self.rubber_band = QRubberBand(QRubberBand.Rectangle, self.current_page_label)
+        doc = self.current_doc
+        doc.selection_start = pos
 
-        self.rubber_band.setGeometry(QRect(pos, QSize()))
-        self.rubber_band.show()
+        if doc.rubber_band is None:
+            doc.rubber_band = QRubberBand(QRubberBand.Rectangle, doc.current_page_label)
+
+        doc.rubber_band.setGeometry(QRect(pos, QSize()))
+        doc.rubber_band.show()
 
     def _on_mouse_move(self, event):
         """鼠标移动 - 更新选择区域或检测注释悬停"""
-        if not self.doc:
+        if not self.current_doc:
             return
 
-        # 获取事件源和坐标
+        doc = self.current_doc
         sender = self.sender()
         pos = event.pos()
 
         # 如果事件源是 page_label，将坐标转换为相对于 pages_container
         if sender and hasattr(sender, 'page_index'):
-            # 事件来自 page_label，需要转换坐标
             global_pos = sender.mapToGlobal(pos)
-            pos = self.pages_container.mapFromGlobal(global_pos)
+            pos = doc.pages_container.mapFromGlobal(global_pos)
 
-        if self.is_selecting and self.page_text_chars and self.current_page_label:
+        if doc.is_selecting and doc.page_text_chars and doc.current_page_label:
             # 文本选择模式 - 字符级精度
-            local_pos = self.current_page_label.mapFrom(self.pages_container, pos)
-            pdf_point = self._screen_to_pdf_point(self.current_page_label, local_pos)
+            local_pos = doc.current_page_label.mapFrom(doc.pages_container, pos)
+            pdf_point = self._screen_to_pdf_point(doc.current_page_label, local_pos)
             char_idx = self._get_char_at_point(pdf_point, (local_pos.x(), local_pos.y()))
             if char_idx >= 0:
-                self.selection_end_char = char_idx
+                doc.selection_end_char = char_idx
                 self._update_text_selection()
-        elif self.rubber_band and self.rubber_band.isVisible():
+        elif doc.rubber_band and doc.rubber_band.isVisible():
             # 区域选择模式
-            if hasattr(self, 'selection_start') and self.current_page_label:
-                local_pos = self.current_page_label.mapFrom(self.pages_container, pos)
-                rect = QRect(self.selection_start, local_pos).normalized()
-                self.rubber_band.setGeometry(rect)
+            if hasattr(doc, 'selection_start') and doc.current_page_label:
+                local_pos = doc.current_page_label.mapFrom(doc.pages_container, pos)
+                rect = QRect(doc.selection_start, local_pos).normalized()
+                doc.rubber_band.setGeometry(rect)
         else:
             # 非选择模式，检测注释悬停
-            # 若 is_selecting == True，则屏蔽 Hover-Engine
-            if not self.is_selecting:
+            if not doc.is_selecting:
                 self._check_annot_hover(pos)
 
     def _on_mouse_release(self, event):
         """鼠标释放 - 完成选择，按住 Ctrl 时自动复制文本"""
-        if not self.doc or event.button() != Qt.LeftButton:
+        if not self.current_doc or event.button() != Qt.LeftButton:
             return
 
-        if self.is_selecting and self.page_text_chars:
+        doc = self.current_doc
+
+        if doc.is_selecting and doc.page_text_chars:
             # 文本选择模式
-            self.is_selecting = False
+            doc.is_selecting = False
 
             # 如果按住 Ctrl，自动复制选中的文本
-            if (event.modifiers() & Qt.ControlModifier) and self.current_selected_text:
-                self._copy_to_clipboard(self.current_selected_text)
+            if (event.modifiers() & Qt.ControlModifier) and doc.current_selected_text:
+                self._copy_to_clipboard(doc.current_selected_text)
 
-            self.is_ctrl_pressed = False
+            doc.is_ctrl_pressed = False
 
         elif self.rubber_band and self.rubber_band.isVisible():
             # 区域选择模式 - 隐藏选择框
@@ -2228,11 +2814,11 @@ class PDFViewer(QMainWindow):
 
     def _is_scanned_page(self) -> bool:
         """检测当前页面是否为扫描图片（无文本）"""
-        if not self.doc:
+        if not self.current_doc or not self.current_doc.doc:
             return False
 
         try:
-            page = self.doc[self.current_page]
+            page = self.current_doc.doc[self.current_doc.current_page]
             text = page.get_text("text").strip()
             return len(text) == 0
         except:
@@ -2240,20 +2826,20 @@ class PDFViewer(QMainWindow):
 
     def _save_page_as_image(self):
         """保存当前页面为图片"""
-        if not self.doc or not self.file_path:
+        if not self.current_doc or not self.current_doc.doc or not self.current_doc.file_path:
             return
 
         try:
-            page = self.doc[self.current_page]
+            page = self.current_doc.doc[self.current_doc.current_page]
 
             # 生成文件名：修改日期_时间_hash.png
-            file_mtime = os.path.getmtime(self.file_path)
+            file_mtime = os.path.getmtime(self.current_doc.file_path)
             dt = datetime.fromtimestamp(file_mtime)
             date_str = dt.strftime("%Y%m%d")
             time_str = dt.strftime("%H%M%S")
 
             # 使用当前时间和页面号生成 hash
-            hash_input = f"{file_mtime}_{self.current_page}_{time.time()}"
+            hash_input = f"{file_mtime}_{self.current_doc.current_page}_{time.time()}"
             hash_str = hashlib.md5(hash_input.encode()).hexdigest()[:8]
 
             default_name = f"{date_str}_{time_str}_{hash_str}.png"
@@ -2280,7 +2866,7 @@ class PDFViewer(QMainWindow):
 
     def _show_context_menu(self, pos):
         """显示右键菜单"""
-        if not self.doc:
+        if not self.current_doc or not self.current_doc.doc:
             return
 
         menu = QMenu(self)
@@ -2309,14 +2895,14 @@ class PDFViewer(QMainWindow):
             underline_action.triggered.connect(self._add_underline_annot)
 
             # 如果没有文本选区，禁用高亮和下划线
-            if not self.current_selected_text:
+            if not self.current_doc.current_selected_text:
                 highlight_action.setEnabled(False)
                 underline_action.setEnabled(False)
 
             menu.addSeparator()
 
             # 复制选项
-            if self.current_selected_text:
+            if self.current_doc.current_selected_text:
                 copy_action = menu.addAction("复制(&C)")
                 copy_action.setShortcut("Ctrl+C")
                 copy_action.triggered.connect(self._copy_current_selection)
@@ -2328,7 +2914,7 @@ class PDFViewer(QMainWindow):
 
     def _get_annotation_at_pos(self, pos):
         """检查指定位置是否有注释"""
-        if not self.doc or not self._annot_hotspot_map:
+        if not self.current_doc or not self.current_doc.doc or not self.current_doc._annot_hotspot_map:
             return None
 
         page_label, page_idx, local_pos = self._get_page_at_pos(pos)
@@ -2338,14 +2924,14 @@ class PDFViewer(QMainWindow):
         # 计算 PDF 坐标
         screen = QApplication.primaryScreen()
         dpi_scale = screen.logicalDotsPerInchX() / 96.0 if screen else 1.0
-        scale = self.zoom_factor * dpi_scale
+        scale = self.current_doc.zoom_factor * dpi_scale
 
         pdf_x = local_pos.x() / scale
         pdf_y = local_pos.y() / scale
 
         # 检查是否在注释区域内
-        if page_idx in self._annot_hotspot_map:
-            for annot_info in self._annot_hotspot_map[page_idx]:
+        if page_idx in self.current_doc._annot_hotspot_map:
+            for annot_info in self.current_doc._annot_hotspot_map[page_idx]:
                 rect = annot_info["rect"]
                 if rect.x0 <= pdf_x <= rect.x1 and rect.y0 <= pdf_y <= rect.y1:
                     return annot_info
@@ -2359,13 +2945,13 @@ class PDFViewer(QMainWindow):
             return
 
         try:
-            page = self.doc[page_idx]
+            page = self.current_doc.doc[page_idx]
             annots = list(page.annots())
 
             # 计算 PDF 坐标
             screen = QApplication.primaryScreen()
             dpi_scale = screen.logicalDotsPerInchX() / 96.0 if screen else 1.0
-            scale = self.zoom_factor * dpi_scale
+            scale = self.current_doc.zoom_factor * dpi_scale
 
             pdf_x = local_pos.x() / scale
             pdf_y = local_pos.y() / scale
@@ -2392,35 +2978,35 @@ class PDFViewer(QMainWindow):
 
     def _copy_current_selection(self):
         """复制当前选区的文本到剪贴板"""
-        if self.current_selected_text:
-            self._copy_to_clipboard(self.current_selected_text)
+        if self.current_doc.current_selected_text:
+            self._copy_to_clipboard(self.current_doc.current_selected_text)
 
     def _add_highlight(self):
         """为当前选区添加高亮注释 - 按行分别高亮"""
-        if not self.doc or not self.current_selected_text:
+        if not self.current_doc or not self.current_doc.doc or not self.current_doc.current_selected_text:
             return
 
         try:
-            page = self.doc[self.current_page]
+            page = self.current_doc.doc[self.current_doc.current_page]
 
             # 获取选中的字符范围
-            start_idx = min(self.selection_start_char, self.selection_end_char)
-            end_idx = max(self.selection_start_char, self.selection_end_char)
+            start_idx = min(self.current_doc.selection_start_char, self.current_doc.selection_end_char)
+            end_idx = max(self.current_doc.selection_start_char, self.current_doc.selection_end_char)
 
             # 边界检查
             start_idx = max(0, start_idx)
-            end_idx = min(end_idx, len(self.page_text_chars) - 1)
+            end_idx = min(end_idx, len(self.current_doc.page_text_chars) - 1)
 
-            if start_idx > end_idx or not self.page_text_chars:
+            if start_idx > end_idx or not self.current_doc.page_text_chars:
                 return
 
             # 按行分组字符
             line_groups = []
-            current_line = [self.page_text_chars[start_idx]]
-            current_y_center = sum(self.page_text_chars[start_idx]["bbox"][1::2]) / 2
+            current_line = [self.current_doc.page_text_chars[start_idx]]
+            current_y_center = sum(self.current_doc.page_text_chars[start_idx]["bbox"][1::2]) / 2
 
             for i in range(start_idx + 1, end_idx + 1):
-                char_info = self.page_text_chars[i]
+                char_info = self.current_doc.page_text_chars[i]
                 bbox = char_info["bbox"]
                 y_center = (bbox[1] + bbox[3]) / 2
 
@@ -2485,7 +3071,7 @@ class PDFViewer(QMainWindow):
         - 调用 annot.set_info(content=user_text) 存储注释文本
         - 增量保存到 PDF
         """
-        if not self.doc or not self.current_selected_text:
+        if not self.current_doc or not self.current_doc.doc or not self.current_doc.current_selected_text:
             return
 
         # 弹出输入对话框获取注释内容
@@ -2499,26 +3085,26 @@ class PDFViewer(QMainWindow):
             return  # 用户取消
 
         try:
-            page = self.doc[self.current_page]
+            page = self.current_doc.doc[self.current_doc.current_page]
 
             # 获取选中的字符范围
-            start_idx = min(self.selection_start_char, self.selection_end_char)
-            end_idx = max(self.selection_start_char, self.selection_end_char)
+            start_idx = min(self.current_doc.selection_start_char, self.current_doc.selection_end_char)
+            end_idx = max(self.current_doc.selection_start_char, self.current_doc.selection_end_char)
 
             # 边界检查
             start_idx = max(0, start_idx)
-            end_idx = min(end_idx, len(self.page_text_chars) - 1)
+            end_idx = min(end_idx, len(self.current_doc.page_text_chars) - 1)
 
-            if start_idx > end_idx or not self.page_text_chars:
+            if start_idx > end_idx or not self.current_doc.page_text_chars:
                 return
 
             # 按行分组字符（复用高亮功能的逻辑）
             line_groups = []
-            current_line = [self.page_text_chars[start_idx]]
-            current_y_center = sum(self.page_text_chars[start_idx]["bbox"][1::2]) / 2
+            current_line = [self.current_doc.page_text_chars[start_idx]]
+            current_y_center = sum(self.current_doc.page_text_chars[start_idx]["bbox"][1::2]) / 2
 
             for i in range(start_idx + 1, end_idx + 1):
-                char_info = self.page_text_chars[i]
+                char_info = self.current_doc.page_text_chars[i]
                 bbox = char_info["bbox"]
                 y_center = (bbox[1] + bbox[3]) / 2
 
@@ -2589,13 +3175,13 @@ class PDFViewer(QMainWindow):
         - 提取 type == 8 (Highlight) 和 type == 9 (Underline) 的 rect 和 content
         - 建立 HotspotMap = {page_index: [{"rect", "content", "type"}, ...]}
         """
-        if not self.doc:
+        if not self.current_doc or not self.current_doc.doc:
             return
 
-        self._annot_hotspot_map = {}
+        self.current_doc._annot_hotspot_map = {}
 
-        for page_idx in range(self.total_pages):
-            page = self.doc[page_idx]
+        for page_idx in range(self.current_doc.total_pages):
+            page = self.current_doc.doc[page_idx]
             annots = list(page.annots())
 
             page_annots = []
@@ -2625,7 +3211,7 @@ class PDFViewer(QMainWindow):
                     })
 
             if page_annots:
-                self._annot_hotspot_map[page_idx] = page_annots
+                self.current_doc._annot_hotspot_map[page_idx] = page_annots
 
     def _check_annot_hover(self, pos):
         """
@@ -2634,30 +3220,30 @@ class PDFViewer(QMainWindow):
         - 先判断鼠标是否在当前页的 Annots 总包围盒内
         - 再匹配具体的条目
         """
-        if not self.doc or not self._annot_hotspot_map:
+        if not self.current_doc or not self.current_doc.doc or not self.current_doc._annot_hotspot_map:
             self._hide_annot_tooltip()
             return
 
         # 获取当前页面
         page_label, page_idx, local_pos = self._get_page_at_pos(pos)
-        if page_label is None or page_idx < 0 or page_idx not in self._annot_hotspot_map:
+        if page_label is None or page_idx < 0 or page_idx not in self.current_doc._annot_hotspot_map:
             self._hide_annot_tooltip()
             return
 
         # 计算鼠标在 PDF 坐标系中的位置
-        page_annots = self._annot_hotspot_map[page_idx]
+        page_annots = self.current_doc._annot_hotspot_map[page_idx]
 
         # 获取该页的标签和变换信息
-        if page_idx >= len(self.page_labels):
+        if page_idx >= len(self.current_doc.page_labels):
             return
 
-        page_label = self.page_labels[page_idx]
+        page_label = self.current_doc.page_labels[page_idx]
         local_pos = page_label.mapFrom(self.pages_container, pos)
 
         # 像素坐标 -> PDF 坐标（考虑缩放和 DPI）
         screen = QApplication.primaryScreen()
         dpi_scale = screen.logicalDotsPerInchX() / 96.0 if screen else 1.0
-        scale = self.zoom_factor * dpi_scale
+        scale = self.current_doc.zoom_factor * dpi_scale
 
         pdf_x = local_pos.x() / scale
         pdf_y = local_pos.y() / scale
@@ -2759,7 +3345,7 @@ class PDFViewer(QMainWindow):
 
     def _show_auto_toc_dialog(self):
         """显示自动目录生成对话框"""
-        if not self.doc:
+        if not self.current_doc or not self.current_doc.doc:
             QMessageBox.warning(self, "提示", "请先打开 PDF 文件")
             return
 
@@ -2841,7 +3427,7 @@ class PDFViewer(QMainWindow):
 
         # 应用到文档
         try:
-            self.doc.set_toc(toc_list)
+            self.current_doc.doc.set_toc(toc_list)
 
             # 标记文档已修改
             self._mark_document_modified(True)
@@ -2921,7 +3507,7 @@ class PDFViewer(QMainWindow):
             self._toggle_sidebar()
 
         # 如果切换到缩略图视图且未加载过，则加载缩略图
-        if index == 2 and self.doc and self.thumbnail_widget.count() == 0:
+        if index == 2 and self.current_doc and self.current_doc.doc and self.thumbnail_widget.count() == 0:
             self._load_thumbnails()
 
     def _toggle_sidebar(self):
@@ -2958,13 +3544,13 @@ class PDFViewer(QMainWindow):
         """加载所有页面的注释列表"""
         self.annot_widget.clear()
 
-        if not self.doc:
+        if not self.current_doc or not self.current_doc.doc:
             return
 
         try:
             total_annots = 0
-            for page_idx in range(self.total_pages):
-                page = self.doc[page_idx]
+            for page_idx in range(self.current_doc.total_pages):
+                page = self.current_doc.doc[page_idx]
                 annots = list(page.annots())
 
                 for annot in annots:
@@ -3006,10 +3592,14 @@ class PDFViewer(QMainWindow):
     def _on_annot_clicked(self, item: QListWidgetItem):
         """REQ-04: 注释点击事件 - 跳转到对应页面及坐标"""
         page_index = item.data(Qt.UserRole)
-        rect = item.data(Qt.UserRole + 1)  # 获取注释的矩形区域
-        if page_index is not None and 0 <= page_index < self.total_pages:
-            # 使用统一的跳转方法，保持当前缩放
-            self._scroll_to_page(page_index, rect=rect, keep_zoom=True)
+        rect = item.data(Qt.UserRole + 1)
+        if self.current_doc and page_index is not None:
+            if 0 <= page_index < self.current_doc.total_pages:
+                self.current_doc.go_to_page(page_index)
+                # 滚动到页面
+                if page_index < len(self.current_doc.page_labels):
+                    page_label = self.current_doc.page_labels[page_index]
+                    self.current_doc.scroll_area.ensureWidgetVisible(page_label, 50, 50)
 
     def _show_annot_context_menu(self, pos):
         """注释列表右键菜单"""
@@ -3030,17 +3620,17 @@ class PDFViewer(QMainWindow):
 
     def _delete_annotation(self, item):
         """删除指定注释"""
-        if not self.doc:
+        if not self.current_doc or not self.current_doc.doc:
             return
 
         page_index = item.data(Qt.UserRole)
         rect = item.data(Qt.UserRole + 1)
 
-        if page_index is None or page_index < 0 or page_index >= self.total_pages:
+        if page_index is None or page_index < 0 or page_index >= self.current_doc.total_pages:
             return
 
         try:
-            page = self.doc[page_index]
+            page = self.current_doc.doc[page_index]
             annots = list(page.annots())
 
             # 查找匹配的注释（根据页面和矩形区域）
@@ -3068,65 +3658,43 @@ class PDFViewer(QMainWindow):
         """加载页面缩略图"""
         self.thumbnail_widget.clear()
 
-        if not self.doc:
+        if not self.current_doc:
             return
 
         # 使用较小的缩放比例生成缩略图
-        thumb_zoom = 0.15  # 缩略图缩放比例
+        thumb_zoom = 0.15
 
-        for i in range(self.total_pages):
+        for i in range(self.current_doc.total_pages):
             try:
-                page = self.doc[i]
-                mat = fitz.Matrix(thumb_zoom, thumb_zoom)
-                pix = page.get_pixmap(matrix=mat, alpha=False)
-
-                # 使用 .copy() 创建深拷贝，防止 pix 被释放后产生 use-after-free
-                img = QImage(
-                    pix.samples,
-                    pix.width,
-                    pix.height,
-                    pix.stride,
-                    QImage.Format_RGB888 if pix.n == 3 else QImage.Format_ARGB32
-                ).copy()
-
-                pixmap = QPixmap.fromImage(img)
-                item = QListWidgetItem(f"第 {i + 1} 页")
-                item.setIcon(QIcon(pixmap))
-                item.setData(Qt.UserRole, i)
-                item.setTextAlignment(Qt.AlignCenter)
-                self.thumbnail_widget.addItem(item)
-
+                pixmap = self.current_doc.get_page_thumbnail(i, thumb_zoom)
+                if pixmap:
+                    item = QListWidgetItem(f"第 {i + 1} 页")
+                    item.setIcon(QIcon(pixmap))
+                    item.setData(Qt.UserRole, i)
+                    item.setTextAlignment(Qt.AlignCenter)
+                    self.thumbnail_widget.addItem(item)
             except Exception as e:
                 print(f"生成缩略图失败 (第 {i + 1} 页): {e}")
 
     def _scroll_to_page(self, page_index: int, rect: fitz.Rect = None, keep_zoom: bool = True, center: bool = True):
-        """REQ-04: 滚动到指定页面及坐标位置，支持垂直居中
-
-        Args:
-            page_index: 页码索引（从 0 开始）
-            rect: PDF 页面中的矩形区域（fitz.Rect），可选
-            keep_zoom: 是否保持当前缩放倍率（默认 True）
-            center: 是否将目标区域垂直居中（默认 True）
-        """
-        if not (0 <= page_index < len(self.page_labels)):
+        """REQ-04: 滚动到指定页面及坐标位置"""
+        if not self.current_doc:
             return
 
-        page_label = self.page_labels[page_index]
+        doc = self.current_doc
+        if not (0 <= page_index < len(doc.page_labels)):
+            return
 
-        # 滚动到页面位置
+        page_label = doc.page_labels[page_index]
+        scroll_area = doc.scroll_area
+
+        # 滚动到页面
         if rect is not None:
-            # 如果有指定坐标区域，计算在 QLabel 中的对应位置
-            # 使用当前缩放因子（不强制重置）
-            zoom = self.zoom_factor if keep_zoom else 1.0
-
-            # 获取 DPI 缩放因子
+            zoom = doc.zoom_factor if keep_zoom else 1.0
             screen = QApplication.primaryScreen()
             dpi_scale = screen.logicalDotsPerInchX() / 96.0 if screen else 1.0
-
-            # 计算 QLabel 中的坐标（考虑缩放）
             scale = zoom * dpi_scale
 
-            # 获取 page_label 在 pages_container 中的位置偏移
             label_pos = page_label.pos()
             x = int(rect.x0 * scale) + label_pos.x()
             y = int(rect.y0 * scale) + label_pos.y()
@@ -3134,46 +3702,44 @@ class PDFViewer(QMainWindow):
             h = int((rect.y1 - rect.y0) * scale)
 
             if center:
-                # 垂直居中：计算滚动位置使目标区域位于视口中央
-                viewport_height = self.scroll_area.viewport().height()
+                viewport_height = scroll_area.viewport().height()
                 target_center_y = y + h // 2
                 scroll_y = max(0, target_center_y - viewport_height // 2)
 
-                # 水平滚动到可见区域即可
-                viewport_width = self.scroll_area.viewport().width()
-                container_width = self.pages_container.width()
+                viewport_width = scroll_area.viewport().width()
+                container_width = doc.pages_container.width()
                 if container_width > viewport_width:
                     target_center_x = x + w // 2
                     scroll_x = max(0, min(target_center_x - viewport_width // 2, container_width - viewport_width))
                 else:
                     scroll_x = 0
 
-                # 设置滚动位置
-                self.scroll_area.horizontalScrollBar().setValue(scroll_x)
-                self.scroll_area.verticalScrollBar().setValue(scroll_y)
+                scroll_area.horizontalScrollBar().setValue(scroll_x)
+                scroll_area.verticalScrollBar().setValue(scroll_y)
             else:
-                # 滚动到该区域（带边距）
-                margin = 50
-                self.scroll_area.ensureVisible(x + margin, y + margin, margin, margin)
+                scroll_area.ensureVisible(x + 50, y + 50, 50, 50)
         else:
-            # 无特定坐标，只滚动到页面
             if center and page_label:
-                # 垂直居中显示整个页面
-                viewport_height = self.scroll_area.viewport().height()
+                viewport_height = scroll_area.viewport().height()
                 label_pos = page_label.pos()
                 page_height = page_label.height()
                 scroll_y = max(0, label_pos.y() + page_height // 2 - viewport_height // 2)
-                self.scroll_area.verticalScrollBar().setValue(scroll_y)
+                scroll_area.verticalScrollBar().setValue(scroll_y)
             else:
-                self.scroll_area.ensureWidgetVisible(page_label, 50, 50)
+                scroll_area.ensureWidgetVisible(page_label, 50, 50)
 
-        self.current_page = page_index
+        doc.current_page = page_index
 
     def _on_thumbnail_clicked(self, item: QListWidgetItem):
         """缩略图点击事件"""
         page_index = item.data(Qt.UserRole)
-        if page_index is not None and 0 <= page_index < self.total_pages:
-            self._scroll_to_page(page_index)
+        if self.current_doc and page_index is not None:
+            if 0 <= page_index < self.current_doc.total_pages:
+                self.current_doc.go_to_page(page_index)
+                # 滚动到页面
+                if page_index < len(self.current_doc.page_labels):
+                    page_label = self.current_doc.page_labels[page_index]
+                    self.current_doc.scroll_area.ensureWidgetVisible(page_label, 50, 50)
 
     # ==================== 搜索功能 ====================
 
@@ -3201,15 +3767,17 @@ class PDFViewer(QMainWindow):
     def _perform_search(self):
         """REQ-06/07: 执行搜索，遍历所有页面查找匹配文本"""
         query = self.search_input.text().strip()
-        if not query or not self.doc:
+        if not query or not self.current_doc:
             return
 
         self.search_results = []
         self.current_search_index = -1
 
+        doc = self.current_doc
+
         # 遍历所有页面
-        for page_idx in range(self.total_pages):
-            page = self.doc[page_idx]
+        for page_idx in range(doc.total_pages):
+            page = doc.doc[page_idx]
             text_dict = page.get_text("rawdict")
 
             # 收集该页所有字符和行信息
@@ -3393,20 +3961,20 @@ class PDFViewer(QMainWindow):
         self._load_page_text_chars(page_idx)
 
         # 设置选择范围
-        self.selection_start_char = char_start
-        self.selection_end_char = char_end
+        self.current_doc.selection_start_char = char_start
+        self.current_doc.selection_end_char = char_end
 
         # 找到对应的 page_label
-        if page_idx < len(self.page_labels):
-            self.current_page_label = self.page_labels[page_idx]
+        if page_idx < len(self.current_doc.page_labels):
+            self.current_doc.current_page_label = self.current_doc.page_labels[page_idx]
             # 更新当前页码，确保覆盖层能正确获取
-            self.current_page = page_idx
+            self.current_doc.current_page = page_idx
             self._update_text_selection()
 
             # REQ-04: 计算搜索结果的矩形区域用于精确定位
             rect = None
-            if self.page_text_chars and char_start < len(self.page_text_chars):
-                start_char = self.page_text_chars[char_start]
+            if self.current_doc.page_text_chars and char_start < len(self.current_doc.page_text_chars):
+                start_char = self.current_doc.page_text_chars[char_start]
                 bbox = start_char.get("bbox", [0, 0, 0, 0])
                 rect = fitz.Rect(bbox)
 
@@ -3418,13 +3986,13 @@ class PDFViewer(QMainWindow):
 
     def _ensure_page_visible(self, page_idx):
         """确保指定页面在视图中可见（用于连续滚动模式）"""
-        if page_idx < 0 or page_idx >= self.total_pages:
+        if page_idx < 0 or page_idx >= self.current_doc.total_pages:
             return
 
         # 如果页面标签列表为空或长度不够，需要渲染
-        if not self.page_labels or len(self.page_labels) <= page_idx:
-            self.current_page = page_idx
-            self.render_page(0, self.zoom_factor)
+        if not self.current_doc.page_labels or len(self.current_doc.page_labels) <= page_idx:
+            self.current_doc.current_page = page_idx
+            self.render_page(0, self.current_doc.zoom_factor)
 
     def _search_prev(self):
         """跳转到上一个搜索结果"""
@@ -3456,7 +4024,7 @@ class PDFViewer(QMainWindow):
         - 保持焦点在搜索框内
         """
         query = self.search_input.text().strip()
-        if not query or not self.doc:
+        if not query or not self.current_doc or not self.current_doc.doc:
             return
 
         # 如果没有搜索结果或搜索词已改变，执行新搜索
@@ -3487,29 +4055,35 @@ class PDFViewer(QMainWindow):
     # ==================== 程序退出清理 ====================
 
     def closeEvent(self, event):
-        """窗口关闭事件 - 检查未保存的修改"""
-        if self._document_modified:
-            reply = QMessageBox.question(
-                self,
-                "未保存的更改",
-                f"文件 \"{os.path.basename(self.file_path)}\" 有未保存的更改。\n是否保存？",
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                QMessageBox.Save
-            )
+        """窗口关闭事件 - 检查所有标签页的未保存修改"""
+        # 检查所有标签页是否有未保存的修改
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            if isinstance(widget, PDFTabDocument) and widget.is_modified():
+                self.tab_widget.setCurrentIndex(i)
+                reply = QMessageBox.question(
+                    self,
+                    "未保存的更改",
+                    f"文件 \"{widget.get_file_name()}\" 有未保存的更改。\n是否保存？",
+                    QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                    QMessageBox.Save
+                )
 
-            if reply == QMessageBox.Save:
-                if self._save_document_safely():
-                    self.statusBar().showMessage("已保存", 2000)
-                else:
-                    QMessageBox.critical(self, "错误", "保存失败")
+                if reply == QMessageBox.Save:
+                    if not widget.save_document():
+                        event.ignore()
+                        return
+                elif reply == QMessageBox.Cancel:
                     event.ignore()
                     return
-            elif reply == QMessageBox.Cancel:
-                event.ignore()
-                return
-            # Discard: 不保存直接关闭
 
-        self._close_document()
+        # 关闭所有标签页
+        while self.tab_widget.count() > 0:
+            widget = self.tab_widget.widget(0)
+            if isinstance(widget, PDFTabDocument):
+                widget.close_document()
+            self.tab_widget.removeTab(0)
+
         event.accept()
 
 
