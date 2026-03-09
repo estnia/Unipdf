@@ -209,9 +209,9 @@ class AutoTocWorker(QThread):
                     if result:
                         toc_candidates.append(result)
 
-                # 内存优化
+                # 内存优化 - 清理未引用的对象
                 if page_idx % 10 == 0:
-                    fitz.TOOLS.store_shrink()
+                    fitz.TOOLS.store_shrink(100)  # 100% 表示清理所有未引用对象
 
             doc.close()
 
