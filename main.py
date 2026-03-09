@@ -28,7 +28,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QRect, QSize, QPoint, QTimer, QMimeData, QThread, pyqtSignal
 from PyQt5.QtGui import (
     QImage, QPixmap, QKeyEvent, QDragEnterEvent, QDropEvent, QClipboard,
-    QPainter, QColor, QFont, QCursor, QFontMetrics, QIcon, QKeySequence
+    QPainter, QColor, QFont, QCursor, QFontMetrics, QIcon, QKeySequence,
+    QMouseEvent
 )
 
 # PDF 引擎: PyMuPDF (兼容新旧版本)
@@ -447,6 +448,8 @@ class PDFViewer(QMainWindow):
         self._annot_hotspot_map = {}
         # 当前悬停的注释
         self._current_hover_annot = None
+        # 文档是否已修改（未保存）
+        self._document_modified = False
         # 浮窗延时定时器
         self._tooltip_timer = QTimer()
         self._tooltip_timer.setSingleShot(True)
@@ -494,6 +497,9 @@ class PDFViewer(QMainWindow):
         # 2. 注释视图
         self.annot_widget = QListWidget()
         self.annot_widget.itemClicked.connect(self._on_annot_clicked)
+        # 启用右键菜单
+        self.annot_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.annot_widget.customContextMenuRequested.connect(self._show_annot_context_menu)
         self.sidebar_stack.addWidget(self.annot_widget)  # 索引 1
 
         # 3. 页面缩略图视图
@@ -551,9 +557,8 @@ class PDFViewer(QMainWindow):
         self.scroll_area.installEventFilter(self)
         # 注意：现在需要动态识别当前操作的页面
 
-        # 右键菜单
-        self.pages_container.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.pages_container.customContextMenuRequested.connect(self._show_context_menu)
+        # 右键菜单 - 通过 eventFilter 处理，不使用 customContextMenuRequested 避免重复触发
+        self.pages_container.setContextMenuPolicy(Qt.NoContextMenu)
 
         # ==================== 底部搜索框（初始隐藏）====================
         self.search_widget = QWidget()
@@ -696,7 +701,7 @@ class PDFViewer(QMainWindow):
 
         # 查找
         find_action = QAction("查找(&F)...", self)
-        find_action.setShortcut("Ctrl+F")
+        # 快捷键由全局 QShortcut 处理，避免重复定义
         find_action.triggered.connect(self._show_search_widget)
         edit_menu.addAction(find_action)
 
@@ -733,6 +738,25 @@ class PDFViewer(QMainWindow):
         Args:
             file_path: PDF 文件的完整路径
         """
+        # 检查是否有未保存的更改
+        if self._document_modified and self.file_path:
+            reply = QMessageBox.question(
+                self, "未保存的更改",
+                f"文件 \"{os.path.basename(self.file_path)}\" 有未保存的更改。\n是否保存？",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save
+            )
+            if reply == QMessageBox.Save:
+                if not self._save_document_safely():
+                    return  # 保存失败，取消打开
+            elif reply == QMessageBox.Cancel:
+                return  # 取消打开
+            # Discard: 继续打开新文档
+
+        # 清除缓存强制刷新
+        self._l2_cache.clear()
+        self._base_pixmaps.clear()
+
         try:
             # 关闭现有文档
             self._close_document()
@@ -743,6 +767,7 @@ class PDFViewer(QMainWindow):
             self.total_pages = len(self.doc)
             self.current_page = 0
             self.zoom_factor = 1.0
+            self._document_modified = False  # 重置修改标记
 
             # 更新窗口标题
             self.setWindowTitle(f"Unipdf - {os.path.basename(file_path)}")
@@ -753,8 +778,14 @@ class PDFViewer(QMainWindow):
             # 构建注释热区索引
             self._build_annot_index()
 
+            # 加载注释侧边栏
+            self._load_annotations()
+
             # 渲染第一页
             self.render_page(self.current_page, self.zoom_factor)
+
+            # 加载缩略图
+            self._load_thumbnails()
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"无法打开 PDF 文件:\n{str(e)}")
@@ -770,6 +801,7 @@ class PDFViewer(QMainWindow):
         self.current_page = 0
         self.zoom_factor = 1.0
         self.toc_widget.clear()
+        self.thumbnail_widget.clear()
 
         # 清除所有页面
         self._clear_all_pages()
@@ -779,16 +811,53 @@ class PDFViewer(QMainWindow):
 
         self.setWindowTitle("Unipdf - 极简 PDF 查看器")
 
-    def _save_document(self):
-        """增量保存文档（用于保存高亮等注释）"""
+    def _mark_document_modified(self, modified: bool = True):
+        """标记文档修改状态并更新标题栏"""
+        self._document_modified = modified
+        if self.file_path:
+            filename = os.path.basename(self.file_path)
+            if modified:
+                self.setWindowTitle(f"Unipdf - {filename} *")
+            else:
+                self.setWindowTitle(f"Unipdf - {filename}")
+
+    def _save_document_safely(self):
+        """
+        安全保存文档（自动处理增量/完整保存）
+        - 首先尝试增量保存（保持原文件结构）
+        - 如果失败（加密、权限等问题），保存到临时文件后替换原文件
+        """
         if not self.doc or not self.file_path:
-            return
+            return False
 
         try:
+            # 首先尝试增量保存
             self.doc.save(self.file_path, incremental=True)
-            self.statusBar().showMessage("已保存", 2000)
+            self._mark_document_modified(False)
+            return True
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"保存失败:\n{str(e)}")
+            error_msg = str(e).lower()
+            # 增量保存失败，尝试完整保存到临时文件后替换
+            if "incremental" in error_msg or "encryption" in error_msg:
+                try:
+                    import shutil
+                    # 保存到临时文件（与原文件同目录以确保在同一文件系统）
+                    temp_path = self.file_path + ".tmp"
+                    self.doc.save(temp_path)
+                    # 替换原文件
+                    shutil.move(temp_path, self.file_path)
+                    self._mark_document_modified(False)
+                    return True
+                except Exception:
+                    return False
+            return False
+
+    def _save_document(self):
+        """保存文档（菜单触发）"""
+        if self._save_document_safely():
+            self.statusBar().showMessage("已保存", 2000)
+        else:
+            QMessageBox.critical(self, "错误", "保存失败")
 
     # ==================== 目录加载与跳转 ====================
 
@@ -967,6 +1036,10 @@ class PDFViewer(QMainWindow):
                 page_label.page_index = page_idx  # 存储页码
                 self.page_labels.append(page_label)
                 self.page_overlays.append(overlay)
+
+                # 安装事件过滤器以支持悬停检测
+                page_label.setMouseTracking(True)
+                page_label.installEventFilter(self)
 
                 # 添加到布局
                 self.pages_layout.addWidget(page_label)
@@ -1335,16 +1408,60 @@ class PDFViewer(QMainWindow):
                 event.accept()
                 return True  # 拦截事件，阻止 scroll_area 滚动
 
-        # 处理 pages_container 的鼠标事件
-        if obj == self.pages_container and self.doc:
+        # 处理 pages_container 或其子控件（page_labels）的鼠标事件
+        is_page_label = hasattr(obj, 'page_index')
+        if (obj == self.pages_container or is_page_label) and self.doc:
             if event.type() == event.MouseButtonPress:
-                self._on_mouse_press(event)
+                if event.button() == Qt.RightButton:
+                    # 处理右键点击
+                    pos = event.pos()
+                    if is_page_label:
+                        # 转换坐标到 pages_container
+                        global_pos = obj.mapToGlobal(pos)
+                        pos = self.pages_container.mapFromGlobal(global_pos)
+                    self._show_context_menu(pos)
+                else:
+                    # 处理左键点击 - 确保坐标在 pages_container 坐标系
+                    if is_page_label:
+                        pos = event.pos()
+                        global_pos = obj.mapToGlobal(pos)
+                        new_pos = self.pages_container.mapFromGlobal(global_pos)
+                        # 创建新的事件对象（使用转换后的坐标）
+                        new_event = QMouseEvent(
+                            event.type(), new_pos, event.button(),
+                            event.buttons(), event.modifiers()
+                        )
+                        self._on_mouse_press(new_event)
+                    else:
+                        self._on_mouse_press(event)
                 return True
             elif event.type() == event.MouseMove:
-                self._on_mouse_move(event)
+                # 处理鼠标移动 - 确保坐标在 pages_container 坐标系
+                if is_page_label:
+                    pos = event.pos()
+                    global_pos = obj.mapToGlobal(pos)
+                    new_pos = self.pages_container.mapFromGlobal(global_pos)
+                    new_event = QMouseEvent(
+                        event.type(), new_pos, event.button(),
+                        event.buttons(), event.modifiers()
+                    )
+                    self._on_mouse_move(new_event)
+                else:
+                    self._on_mouse_move(event)
                 return True
             elif event.type() == event.MouseButtonRelease:
-                self._on_mouse_release(event)
+                # 处理鼠标释放 - 确保坐标在 pages_container 坐标系
+                if is_page_label:
+                    pos = event.pos()
+                    global_pos = obj.mapToGlobal(pos)
+                    new_pos = self.pages_container.mapFromGlobal(global_pos)
+                    new_event = QMouseEvent(
+                        event.type(), new_pos, event.button(),
+                        event.buttons(), event.modifiers()
+                    )
+                    self._on_mouse_release(new_event)
+                else:
+                    self._on_mouse_release(event)
                 return True
 
         return super().eventFilter(obj, event)
@@ -1932,7 +2049,15 @@ class PDFViewer(QMainWindow):
         if not self.doc:
             return
 
+        # 获取事件源和坐标
+        sender = self.sender()
         pos = event.pos()
+
+        # 如果事件源是 page_label，将坐标转换为相对于 pages_container
+        if sender and hasattr(sender, 'page_index'):
+            # 事件来自 page_label，需要转换坐标
+            global_pos = sender.mapToGlobal(pos)
+            pos = self.pages_container.mapFromGlobal(global_pos)
 
         if self.is_selecting and self.page_text_chars and self.current_page_label:
             # 文本选择模式 - 字符级精度
@@ -2050,6 +2175,13 @@ class PDFViewer(QMainWindow):
 
         menu = QMenu(self)
 
+        # 首先检查是否点击了注释（优先显示删除注释选项）
+        clicked_annot = self._get_annotation_at_pos(pos)
+        if clicked_annot:
+            delete_action = menu.addAction("删除注释(&D)")
+            delete_action.triggered.connect(lambda: self._delete_annot_at_pos(pos))
+            menu.addSeparator()
+
         # 判断是否为扫描页面（无文本）
         is_scanned = self._is_scanned_page()
 
@@ -2083,6 +2215,70 @@ class PDFViewer(QMainWindow):
                 no_copy_action.setEnabled(False)
 
         menu.exec_(self.pages_container.mapToGlobal(pos))
+
+    def _get_annotation_at_pos(self, pos):
+        """检查指定位置是否有注释"""
+        if not self.doc or not self._annot_hotspot_map:
+            return None
+
+        page_label, page_idx, local_pos = self._get_page_at_pos(pos)
+        if page_label is None or page_idx < 0:
+            return None
+
+        # 计算 PDF 坐标
+        screen = QApplication.primaryScreen()
+        dpi_scale = screen.logicalDotsPerInchX() / 96.0 if screen else 1.0
+        scale = self.zoom_factor * dpi_scale
+
+        pdf_x = local_pos.x() / scale
+        pdf_y = local_pos.y() / scale
+
+        # 检查是否在注释区域内
+        if page_idx in self._annot_hotspot_map:
+            for annot_info in self._annot_hotspot_map[page_idx]:
+                rect = annot_info["rect"]
+                if rect.x0 <= pdf_x <= rect.x1 and rect.y0 <= pdf_y <= rect.y1:
+                    return annot_info
+
+        return None
+
+    def _delete_annot_at_pos(self, pos):
+        """删除指定位置的注释"""
+        page_label, page_idx, local_pos = self._get_page_at_pos(pos)
+        if page_label is None or page_idx < 0:
+            return
+
+        try:
+            page = self.doc[page_idx]
+            annots = list(page.annots())
+
+            # 计算 PDF 坐标
+            screen = QApplication.primaryScreen()
+            dpi_scale = screen.logicalDotsPerInchX() / 96.0 if screen else 1.0
+            scale = self.zoom_factor * dpi_scale
+
+            pdf_x = local_pos.x() / scale
+            pdf_y = local_pos.y() / scale
+
+            # 查找并删除匹配的注释
+            for annot in annots:
+                rect = annot.rect
+                if rect.x0 <= pdf_x <= rect.x1 and rect.y0 <= pdf_y <= rect.y1:
+                    page.delete_annot(annot)
+                    self._mark_document_modified(True)
+                    # 刷新显示
+                    self._l2_cache.clear()
+                    self._base_pixmaps.clear()
+                    self.render_timer.stop()
+                    self._do_render()
+                    self._load_thumbnails()
+                    self._load_annotations()
+                    self._build_annot_index()
+                    self.statusBar().showMessage("已删除注释（未保存）", 3000)
+                    return
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"删除注释失败:\n{str(e)}")
 
     def _copy_current_selection(self):
         """复制当前选区的文本到剪贴板"""
@@ -2148,12 +2344,24 @@ class PDFViewer(QMainWindow):
                 # 添加高亮注释
                 highlight = page.add_highlight_annot(pdf_rect)
                 if highlight:
+                    # 应用注释更改
+                    highlight.update()
                     highlight_count += 1
 
             if highlight_count > 0:
-                # 重新渲染以显示高亮
-                self.render_page(0, self.zoom_factor)
-                self.statusBar().showMessage(f"已添加 {highlight_count} 处高亮，请保存以持久化", 3000)
+                # 标记文档已修改
+                self._mark_document_modified(True)
+                # 清除缓存强制重新渲染
+                self._l2_cache.clear()
+                self._base_pixmaps.clear()
+                # 立即重新渲染以显示高亮（跳过延迟）
+                self.render_timer.stop()
+                self._do_render()
+                # 刷新缩略图以同步显示注释
+                self._load_thumbnails()
+                # 刷新注释侧边栏
+                self._load_annotations()
+                self.statusBar().showMessage(f"已添加 {highlight_count} 处高亮（未保存）", 3000)
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"添加高亮失败:\n{str(e)}")
@@ -2234,18 +2442,29 @@ class PDFViewer(QMainWindow):
                 # 添加下划线注释
                 underline = page.add_underline_annot(pdf_rect)
                 if underline:
+                    # 设置下划线颜色为红色 (RGB: 1, 0, 0)
+                    underline.set_colors(stroke=(1, 0, 0))
                     # 设置注释内容（PDF 标准 Contents 属性）
                     underline.set_info(content=text)
+                    # 应用注释更改
+                    underline.update()
                     annot_count += 1
 
             if annot_count > 0:
-                # 增量保存
-                if self.file_path:
-                    self.doc.save(self.file_path, incremental=True)
+                # 标记文档已修改
+                self._mark_document_modified(True)
 
-                # 重新渲染以显示下划线
-                self.render_page(0, self.zoom_factor)
-                self.statusBar().showMessage(f"已添加 {annot_count} 处下划线注释", 3000)
+                # 清除缓存强制重新渲染
+                self._l2_cache.clear()
+                self._base_pixmaps.clear()
+                # 立即重新渲染以显示下划线（跳过延迟）
+                self.render_timer.stop()
+                self._do_render()
+                # 刷新缩略图以同步显示注释
+                self._load_thumbnails()
+                # 刷新注释侧边栏
+                self._load_annotations()
+                self.statusBar().showMessage(f"已添加 {annot_count} 处下划线注释（未保存）", 3000)
 
                 # 更新热区索引
                 self._build_annot_index()
@@ -2257,8 +2476,8 @@ class PDFViewer(QMainWindow):
         """
         构建注释热区索引
         - 扫描所有页面的 annots()
-        - 提取 type == 9 (Underline) 的 rect 和 content
-        - 建立 HotspotMap = {page_index: [{"rect", "content"}, ...]}
+        - 提取 type == 8 (Highlight) 和 type == 9 (Underline) 的 rect 和 content
+        - 建立 HotspotMap = {page_index: [{"rect", "content", "type"}, ...]}
         """
         if not self.doc:
             return
@@ -2271,17 +2490,29 @@ class PDFViewer(QMainWindow):
 
             page_annots = []
             for annot in annots:
-                # annot.type 返回 (type_num, type_name)
-                # type_num == 9 表示 Underline
+                # annot.type 返回 (type_num, type_name) 或整数（取决于 PyMuPDF 版本）
                 annot_type = annot.type
-                if annot_type and annot_type[0] == 9:  # Underline
+                if isinstance(annot_type, tuple):
+                    type_num = annot_type[0]
+                else:
+                    type_num = annot_type
+
+                # 处理高亮 (8) 和下划线 (9) 注释
+                if type_num in (8, 9):  # Highlight 或 Underline
                     rect = annot.rect
-                    content = annot.info.get("content", "") if annot.info else ""
-                    if content:  # 只存储有内容的注释
-                        page_annots.append({
-                            "rect": rect,
-                            "content": content
-                        })
+                    info = annot.info
+                    content = info.get("content", "") if info else ""
+
+                    # 对于下划线，需要有内容才显示悬停提示
+                    # 对于高亮，即使没有内容也可以右键删除
+                    if type_num == 9 and not content:
+                        continue
+
+                    page_annots.append({
+                        "rect": rect,
+                        "content": content,
+                        "type": type_num  # 8=高亮, 9=下划线
+                    })
 
             if page_annots:
                 self._annot_hotspot_map[page_idx] = page_annots
@@ -2298,8 +2529,8 @@ class PDFViewer(QMainWindow):
             return
 
         # 获取当前页面
-        page_idx = self._get_page_at_pos(pos)
-        if page_idx < 0 or page_idx not in self._annot_hotspot_map:
+        page_label, page_idx, local_pos = self._get_page_at_pos(pos)
+        if page_label is None or page_idx < 0 or page_idx not in self._annot_hotspot_map:
             self._hide_annot_tooltip()
             return
 
@@ -2502,9 +2733,8 @@ class PDFViewer(QMainWindow):
         try:
             self.doc.set_toc(toc_list)
 
-            # 增量保存
-            if self.file_path:
-                self.doc.save(self.file_path, incremental=True)
+            # 标记文档已修改
+            self._mark_document_modified(True)
 
             # 刷新目录显示
             self._load_toc()
@@ -2516,7 +2746,7 @@ class PDFViewer(QMainWindow):
 
             QMessageBox.information(
                 self, "完成",
-                f"成功生成目录，共 {len(toc_list)} 个条目"
+                f"成功生成目录，共 {len(toc_list)} 个条目（未保存）"
             )
 
         except Exception as e:
@@ -2615,30 +2845,49 @@ class PDFViewer(QMainWindow):
             self._switch_sidebar_view(0)  # 0 = 目录选项卡
 
     def _load_annotations(self):
-        """加载当前页面的注释列表"""
+        """加载所有页面的注释列表"""
         self.annot_widget.clear()
 
         if not self.doc:
             return
 
         try:
-            page = self.doc[self.current_page]
-            annots = list(page.annots())
+            total_annots = 0
+            for page_idx in range(self.total_pages):
+                page = self.doc[page_idx]
+                annots = list(page.annots())
 
-            if not annots:
-                item = QListWidgetItem("(当前页面无注释)")
+                for annot in annots:
+                    # 处理注释类型（兼容不同 PyMuPDF 版本）
+                    annot_type_raw = annot.type
+                    if isinstance(annot_type_raw, tuple):
+                        annot_type = annot_type_raw[1] if len(annot_type_raw) > 1 else "未知"
+                    else:
+                        # 根据类型数字映射名称
+                        type_map = {8: "高亮", 9: "下划线", 10: "删除线", 11: "波浪线",
+                                    0: "文本", 12: "盖章", 14: "墨水", 15: "弹出", 16: "文件附件"}
+                        annot_type = type_map.get(annot_type_raw, f"类型{annot_type_raw}")
+
+                    info = annot.info
+                    content = info.get("content", "") if info else ""
+
+                    # 格式化显示文本
+                    if content:
+                        display_text = f"第{page_idx+1}页 [{annot_type}] {content[:40]}"
+                        if len(content) > 40:
+                            display_text += "..."
+                    else:
+                        display_text = f"第{page_idx+1}页 [{annot_type}] (无内容)"
+
+                    item = QListWidgetItem(display_text)
+                    item.setData(Qt.UserRole, page_idx)
+                    item.setData(Qt.UserRole + 1, annot.rect)
+                    self.annot_widget.addItem(item)
+                    total_annots += 1
+
+            if total_annots == 0:
+                item = QListWidgetItem("(文档中无注释)")
                 item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
-                self.annot_widget.addItem(item)
-                return
-
-            for i, annot in enumerate(annots):
-                annot_type = annot.type[1] if annot.type else "未知"
-                content = annot.info.get("content", "") if annot.info else ""
-                text = f"[{annot_type}] {content[:30]}..." if len(content) > 30 else f"[{annot_type}] {content}"
-                item = QListWidgetItem(text)
-                item.setData(Qt.UserRole, self.current_page)
-                # REQ-04: 存储注释的矩形区域用于跳转定位
-                item.setData(Qt.UserRole + 1, annot.rect)
                 self.annot_widget.addItem(item)
 
         except Exception as e:
@@ -2651,6 +2900,59 @@ class PDFViewer(QMainWindow):
         if page_index is not None and 0 <= page_index < self.total_pages:
             # 使用统一的跳转方法，保持当前缩放
             self._scroll_to_page(page_index, rect=rect, keep_zoom=True)
+
+    def _show_annot_context_menu(self, pos):
+        """注释列表右键菜单"""
+        item = self.annot_widget.itemAt(pos)
+        if not item:
+            return
+
+        # 检查是否是有效注释项（不是"无注释"提示）
+        page_index = item.data(Qt.UserRole)
+        if page_index is None:
+            return
+
+        menu = QMenu(self)
+        delete_action = menu.addAction("删除注释(&D)")
+        delete_action.triggered.connect(lambda: self._delete_annotation(item))
+
+        menu.exec_(self.annot_widget.mapToGlobal(pos))
+
+    def _delete_annotation(self, item):
+        """删除指定注释"""
+        if not self.doc:
+            return
+
+        page_index = item.data(Qt.UserRole)
+        rect = item.data(Qt.UserRole + 1)
+
+        if page_index is None or page_index < 0 or page_index >= self.total_pages:
+            return
+
+        try:
+            page = self.doc[page_index]
+            annots = list(page.annots())
+
+            # 查找匹配的注释（根据页面和矩形区域）
+            for annot in annots:
+                if annot.rect == rect:
+                    # 删除注释
+                    page.delete_annot(annot)
+                    # 标记文档已修改
+                    self._mark_document_modified(True)
+                    # 刷新显示
+                    self._l2_cache.clear()
+                    self._base_pixmaps.clear()
+                    self.render_timer.stop()
+                    self._do_render()
+                    self._load_thumbnails()
+                    self._load_annotations()
+                    self._build_annot_index()
+                    self.statusBar().showMessage("已删除注释（未保存）", 3000)
+                    return
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"删除注释失败:\n{str(e)}")
 
     def _load_thumbnails(self):
         """加载页面缩略图"""
@@ -2687,13 +2989,14 @@ class PDFViewer(QMainWindow):
             except Exception as e:
                 print(f"生成缩略图失败 (第 {i + 1} 页): {e}")
 
-    def _scroll_to_page(self, page_index: int, rect: fitz.Rect = None, keep_zoom: bool = True):
-        """REQ-04: 滚动到指定页面及坐标位置
+    def _scroll_to_page(self, page_index: int, rect: fitz.Rect = None, keep_zoom: bool = True, center: bool = True):
+        """REQ-04: 滚动到指定页面及坐标位置，支持垂直居中
 
         Args:
             page_index: 页码索引（从 0 开始）
             rect: PDF 页面中的矩形区域（fitz.Rect），可选
             keep_zoom: 是否保持当前缩放倍率（默认 True）
+            center: 是否将目标区域垂直居中（默认 True）
         """
         if not (0 <= page_index < len(self.page_labels)):
             return
@@ -2712,17 +3015,47 @@ class PDFViewer(QMainWindow):
 
             # 计算 QLabel 中的坐标（考虑缩放）
             scale = zoom * dpi_scale
-            x = int(rect.x0 * scale)
-            y = int(rect.y0 * scale)
+
+            # 获取 page_label 在 pages_container 中的位置偏移
+            label_pos = page_label.pos()
+            x = int(rect.x0 * scale) + label_pos.x()
+            y = int(rect.y0 * scale) + label_pos.y()
             w = int((rect.x1 - rect.x0) * scale)
             h = int((rect.y1 - rect.y0) * scale)
 
-            # 滚动到该区域（带边距）
-            margin = 50
-            self.scroll_area.ensureVisible(x + margin, y + margin, margin, margin)
+            if center:
+                # 垂直居中：计算滚动位置使目标区域位于视口中央
+                viewport_height = self.scroll_area.viewport().height()
+                target_center_y = y + h // 2
+                scroll_y = max(0, target_center_y - viewport_height // 2)
+
+                # 水平滚动到可见区域即可
+                viewport_width = self.scroll_area.viewport().width()
+                container_width = self.pages_container.width()
+                if container_width > viewport_width:
+                    target_center_x = x + w // 2
+                    scroll_x = max(0, min(target_center_x - viewport_width // 2, container_width - viewport_width))
+                else:
+                    scroll_x = 0
+
+                # 设置滚动位置
+                self.scroll_area.horizontalScrollBar().setValue(scroll_x)
+                self.scroll_area.verticalScrollBar().setValue(scroll_y)
+            else:
+                # 滚动到该区域（带边距）
+                margin = 50
+                self.scroll_area.ensureVisible(x + margin, y + margin, margin, margin)
         else:
             # 无特定坐标，只滚动到页面
-            self.scroll_area.ensureWidgetVisible(page_label, 50, 50)
+            if center and page_label:
+                # 垂直居中显示整个页面
+                viewport_height = self.scroll_area.viewport().height()
+                label_pos = page_label.pos()
+                page_height = page_label.height()
+                scroll_y = max(0, label_pos.y() + page_height // 2 - viewport_height // 2)
+                self.scroll_area.verticalScrollBar().setValue(scroll_y)
+            else:
+                self.scroll_area.ensureWidgetVisible(page_label, 50, 50)
 
         self.current_page = page_index
 
@@ -3044,7 +3377,28 @@ class PDFViewer(QMainWindow):
     # ==================== 程序退出清理 ====================
 
     def closeEvent(self, event):
-        """窗口关闭事件 - 清理资源"""
+        """窗口关闭事件 - 检查未保存的修改"""
+        if self._document_modified:
+            reply = QMessageBox.question(
+                self,
+                "未保存的更改",
+                f"文件 \"{os.path.basename(self.file_path)}\" 有未保存的更改。\n是否保存？",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save
+            )
+
+            if reply == QMessageBox.Save:
+                if self._save_document_safely():
+                    self.statusBar().showMessage("已保存", 2000)
+                else:
+                    QMessageBox.critical(self, "错误", "保存失败")
+                    event.ignore()
+                    return
+            elif reply == QMessageBox.Cancel:
+                event.ignore()
+                return
+            # Discard: 不保存直接关闭
+
         self._close_document()
         event.accept()
 
