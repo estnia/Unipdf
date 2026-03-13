@@ -8,7 +8,30 @@
       "Bash(pip3 install PyMuPDF==1.21.1 --break-system-packages)",
       "Bash(python3 test_xvfb.py 2>&1)",
       "Bash(python3 -c \"import pymupdf; doc = pymupdf.open\\(\\); print\\('PyMuPDF version:', pymupdf.__doc__.split\\(\\)[1] if pymupdf.__doc__ else 'unknown'\\)\")",
-      "Bash(python3 /home/feifei/Unipdf/test_hover.py 2>&1)"
+      "Bash(python3 /home/feifei/Unipdf/test_hover.py 2>&1)",
+      "Bash(python3 -m py_compile main.py && echo \"Syntax OK\")",
+      "Bash(kill 24571 24595 2>/dev/null; sleep 1; echo \"Killed old processes\")",
+      "Bash(python3 test_zoom.py 2>&1)",
+      "Bash(python3 -m py_compile main.py 2>&1 | head -50)",
+      "Bash(python3 -m py_compile main.py 2>&1 | head -20)",
+      "Bash(python3 test_multitab.py 2>&1 | head -100)",
+      "Bash(DISPLAY=:99 python3 highlight_screenshot.py 2>&1)",
+      "Bash(DISPLAY=:99 timeout 90 python3 test_auto_toc.py 2>&1)",
+      "Bash(python3 << 'EOF'\nimport pymupdf\nimport re\n\npdf_path = \"demo/GB 7718-2011预包装食品标签通则.pdf\"\ndoc = pymupdf.open\\(pdf_path\\)\n\n# GBT_PATTERNS L2 模式\nl2_pattern = re.compile\\(r'^\\(\\\\d+\\\\.\\\\d+\\)\\(\\\\s+[\\\\u4e00-\\\\u9fa5]\\)', re.UNICODE\\)\n\nprint\\(\"检查 3.7 和 3.8 的匹配情况：\"\\)\npage = doc[2]  # 第3页\nblocks = page.get_text\\(\"blocks\"\\)\n\nfor block in blocks:\n    x0, y0, x1, y1, text, block_no, block_type = block\n    text = text.strip\\(\\).replace\\('\\\\n', ' '\\)\n    \n    if text.startswith\\('3.7'\\) or text.startswith\\('3.8'\\):\n        match = l2_pattern.match\\(text\\)\n        print\\(f\"文本: {text[:60]}\"\\)\n        print\\(f\"匹配: {match is not None}\"\\)\n        if match:\n            print\\(f\"  组1: {match.group\\(1\\)}\"\\)\n            print\\(f\"  组2: {match.group\\(2\\)}\"\\)\n        print\\(\\)\n\ndoc.close\\(\\)\nEOF)",
+      "Bash(DISPLAY=:99 timeout 90 python3 test_toc_debug.py 2>&1)",
+      "Bash(python3 test_debug_match.py 2>&1)",
+      "Bash(python3 test_toc_fix.py 2>&1)",
+      "Bash(python3 test_debug_process.py 2>&1)",
+      "Bash(python main.py)",
+      "Bash(python3 main.py)",
+      "Bash(python3 -m py_compile pdfviewer/ui/viewer_widget.py && echo \"✓ 语法检查通过\")",
+      "Bash(python3 test_search_highlight.py 2>&1 | head -50)",
+      "Bash(kill 40917 2>/dev/null; rm test_search_highlight.py)",
+      "Bash(python3 -c \"import pdfviewer.ui.main_window; print\\('Syntax OK'\\)\")",
+      "Bash(find /home/feifei/Unipdf -name \"*.pdf\" -type f 2>/dev/null | head -5)",
+      "Bash(python3 test_highlight.py)",
+      "Bash(git add:*)",
+      "Bash(git reset:*)"
     ]
   }
 }

@@ -64,9 +64,9 @@ PREINST
 chmod 755 "${BUILD_DIR}/DEBIAN/preinst"
 
 # 创建 postinst 脚本（安装后执行）
-cat > "${BUILD_DIR}/DEBIAN/postinst" << POSTINST
+cat > "${BUILD_DIR}/DEBIAN/postinst" << 'POSTINST'
 #!/bin/bash
-set -e
+# 不使用 set -e，允许部分安装失败
 
 echo ""
 echo "=== 安装 Unipdf Python 依赖 ==="
@@ -74,21 +74,27 @@ echo ""
 
 WHEELS_DIR="/usr/lib/unipdf-deps/wheels"
 
-# 安装 wheel 包
+# 安装 wheel 包 - 直接安装所有 wheel 文件
 echo "正在安装依赖包..."
 echo "这可能需要几分钟时间..."
 
-pip3 install --no-index --find-links="\${WHEELS_DIR}" \
-    PyMuPDF==1.21.1 \
-    PyQt5==5.15.9 \
-    PyQt5-Qt5==5.15.18 \
-    PyQt5_sip==12.13.0
+# 方法1: 直接安装所有 wheel 文件
+pip3 install --no-index --find-links="${WHEELS_DIR}" ${WHEELS_DIR}/*.whl || {
+    echo "警告: 部分 wheel 安装失败，尝试备用方案..."
+
+    # 方法2: 逐个安装
+    for whl in ${WHEELS_DIR}/*.whl; do
+        echo "安装: $whl"
+        pip3 install --no-index "$whl" 2>/dev/null || echo "  跳过或失败: $(basename $whl)"
+    done
+}
 
 echo ""
 echo "=== 依赖安装完成 ==="
 echo ""
 echo "验证安装:"
-python3 -c "import fitz; from PyQt5.QtWidgets import QApplication; print('所有依赖安装成功！')" 2>/dev/null || echo "部分验证失败，但安装可能已完成"
+python3 -c "import fitz; print('PyMuPDF: OK')" 2>/dev/null || echo "PyMuPDF: 未安装"
+python3 -c "from PyQt5.QtWidgets import QApplication; print('PyQt5: OK')" 2>/dev/null || echo "PyQt5: 未安装"
 echo ""
 echo "现在可以运行: python3 main.py"
 echo ""

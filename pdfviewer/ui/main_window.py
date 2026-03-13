@@ -94,6 +94,11 @@ class MainWindow(QMainWindow):
         # 剪贴板
         self.clipboard = QApplication.clipboard()
 
+        # Page label update timer (debounce) - must be before _add_welcome_tab
+        self._page_label_timer = QTimer()
+        self._page_label_timer.setSingleShot(True)
+        self._page_label_timer.timeout.connect(self._update_page_label)
+
         # 显示欢迎页
         self._add_welcome_tab()
 
@@ -106,6 +111,8 @@ class MainWindow(QMainWindow):
 
         # TOC worker
         self._toc_worker = None
+
+        # Note: _page_label is already initialized in _init_ui()
 
     def _init_ui(self):
         """初始化用户界面 - 左右分割布局"""
@@ -202,6 +209,12 @@ class MainWindow(QMainWindow):
         # 侧边栏初始隐藏
         self.sidebar_container.setVisible(False)
         self._sidebar_visible = False
+
+        # 初始化状态栏页码显示
+        self._page_label = QLabel("第 0 页 / 共 0 页")
+        self._page_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._page_label.setMinimumWidth(150)
+        self.statusBar().addPermanentWidget(self._page_label)
 
     def _init_sidebar_toolbar(self, sidebar_layout):
         """初始化侧边栏工具栏"""
@@ -466,7 +479,8 @@ class MainWindow(QMainWindow):
             self.tab_widget.setTabToolTip(idx, file_path)
             self.tab_widget.setCurrentIndex(idx)
 
-            self.current_doc = doc_widget
+            # current_doc 已在 _create_document_tab 中设置
+            # _on_tab_changed 会被 setCurrentIndex 触发，无需重复设置
 
             # 生成目录
             self._generate_toc(file_path)
@@ -497,10 +511,19 @@ class MainWindow(QMainWindow):
             viewer.text_selected.connect(self._on_text_selected)
             viewer.annotation_added.connect(self._on_annotation_added)
             viewer.zoom_changed.connect(self._on_zoom_changed)
+            viewer.document_loaded.connect(self._update_page_label)
+
+            # 连接滚动信号以更新页码（使用防抖）
+            viewer.scroll_area.verticalScrollBar().valueChanged.connect(
+                lambda value: self._page_label_timer.start(150)
+            )
 
             # 保存引用
             viewer.doc = doc
             viewer.file_path = file_path
+
+            # 先设置 current_doc
+            self.current_doc = viewer
 
             return viewer
 
@@ -510,10 +533,23 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
             return None
 
+    def _update_page_label(self):
+        """更新状态栏页码显示"""
+        if self._page_label is None:
+            return
+
+        viewer = self.current_doc
+
+        if viewer and hasattr(viewer, 'get_current_page') and hasattr(viewer, 'get_page_count'):
+            current_page = viewer.get_current_page()
+            total_pages = viewer.get_page_count()
+            self._page_label.setText(f"第 {current_page + 1} 页 / 共 {total_pages} 页")
+        else:
+            self._page_label.setText("第 0 页 / 共 0 页")
+
     def _on_text_selected(self, text: str):
-        """处理文本选择"""
-        self.statusBar().showMessage(f"已选择 {len(text)} 个字符", 2000)
-        print(f"选中文本: {text[:50]}...")
+        """处理文本选择/复制"""
+        self.statusBar().showMessage(text, 2000)
 
     def _on_annotation_added(self):
         """处理注释添加/更新"""
@@ -523,6 +559,8 @@ class MainWindow(QMainWindow):
     def _on_zoom_changed(self, zoom_factor: float):
         """处理缩放变化"""
         self.statusBar().showMessage(f"缩放: {int(zoom_factor * 100)}%", 2000)
+        # 延迟更新页码（等待缩放动画完成）
+        self._page_label_timer.start(300)
         # 延迟重新计算搜索结果位置，等待页面渲染完成
         if self.search_results:
             from PyQt5.QtCore import QTimer
@@ -639,12 +677,14 @@ class MainWindow(QMainWindow):
             self.current_doc = widget
             self._update_sidebar_for_current_tab()
             self._update_window_title()
+            self._page_label_timer.start(0)  # 立即更新页码
         else:
             self.current_doc = None
             self.toc_widget.clear()
             self.annot_widget.clear()
             self.thumbnail_widget.clear()
             self.setWindowTitle("Unipdf - 极简 PDF 查看器")
+            self._page_label_timer.start(0)
 
     def _on_tab_close_requested(self, index: int):
         """关闭标签页请求"""
@@ -1260,9 +1300,14 @@ class MainWindow(QMainWindow):
     def zoom_reset(self):
         """重置缩放"""
         if self.current_doc and hasattr(self.current_doc, '_doc'):
+            # 获取当前页
+            current_page = self.current_doc.get_current_page()
             self.current_doc._doc.zoom_factor = 1.0
             self.current_doc.set_document(self.current_doc._doc)
             self.statusBar().showMessage("缩放: 100%", 2000)
+            # 重置后跳转回当前页（延迟执行，等待布局完成）
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(150, lambda: self.current_doc.scroll_to_page(current_page))
 
     # ==================== 事件处理 ====================
 

@@ -15,12 +15,12 @@ from typing import Optional, Tuple, List
 import time
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QScrollArea, QVBoxLayout, QHBoxLayout,
-    QSizePolicy, QMenu, QAction, QMessageBox, QApplication
+    QSizePolicy, QMenu, QAction, QMessageBox, QApplication, QShortcut
 )
 from PyQt5.QtCore import Qt, QRect, QRectF, QPoint, QSize, pyqtSignal
 from PyQt5.QtGui import (
     QPixmap, QImage, QPainter, QColor, QMouseEvent,
-    QContextMenuEvent, QCursor
+    QContextMenuEvent, QCursor, QKeySequence
 )
 
 # PDF engine
@@ -189,6 +189,7 @@ class ViewerWidget(QWidget):
     annotation_clicked = pyqtSignal(int, dict)  # page_idx, annot_info
     annotation_added = pyqtSignal()  # Annotation added/updated
     zoom_changed = pyqtSignal(float)  # Zoom factor changed
+    document_loaded = pyqtSignal()  # Document finished loading
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -228,6 +229,7 @@ class ViewerWidget(QWidget):
         self._zoom_timer.timeout.connect(self._apply_zoom_anchor)
         self._pending_zoom_anchor = None
         self._last_zoom_time = 0
+        self._zoom_render_version = 0  # Track zoom changes to skip stale renders
 
         # UI setup
         self._init_ui()
@@ -263,12 +265,10 @@ class ViewerWidget(QWidget):
 
     def _init_shortcuts(self):
         """Initialize keyboard shortcuts."""
-        # Copy shortcut (Ctrl+C)
-        copy_action = QAction("复制", self)
-        copy_action.setShortcut("Ctrl+C")
-        copy_action.setShortcutContext(Qt.WidgetShortcut)
-        copy_action.triggered.connect(self._copy_selection)
-        self.addAction(copy_action)
+        # Copy shortcut (Ctrl+C) - use QShortcut for global window context
+        self._copy_shortcut = QShortcut(QKeySequence("Ctrl+C"), self)
+        self._copy_shortcut.setContext(Qt.WindowShortcut)
+        self._copy_shortcut.activated.connect(self._copy_selection)
 
     def set_document(self, doc: Optional[PDFDocument]):
         """Set the current document."""
@@ -277,6 +277,10 @@ class ViewerWidget(QWidget):
 
         if doc and doc.is_open():
             self._load_pages()
+
+            # Emit document_loaded after layout is ready
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(100, self.document_loaded.emit)
 
             # Apply pending zoom center after layout update
             pending_center = getattr(self, '_pending_zoom_center', None)
@@ -430,6 +434,9 @@ class ViewerWidget(QWidget):
 
             # Update overlay size
             overlay.resize(page_label.size())
+
+            # Refresh annotations overlay (important after zoom/size changes)
+            self._refresh_annotations_for_page(page_idx)
 
         except Exception as e:
             print(f"Failed to reload page {page_idx}: {e}")
@@ -913,7 +920,7 @@ class ViewerWidget(QWidget):
                     self._current_page_idx
                 )
                 if text:
-                    self.text_selected.emit(text)
+                    self.text_selected.emit(f"已选择 {len(text)} 个字符")
 
     def _check_annotation_hover(self, pos, from_container=False):
         """Check if mouse is hovering over an annotation and show tooltip."""
@@ -1030,6 +1037,10 @@ class ViewerWidget(QWidget):
             if text:
                 clipboard = QApplication.clipboard()
                 clipboard.setText(text)
+                # Emit signal for status bar feedback
+                self.text_selected.emit(f"已复制 {len(text)} 个字符到剪贴板")
+            else:
+                self.text_selected.emit("无选中文本")
 
     def _add_highlight(self):
         """Add highlight annotation."""
@@ -1223,6 +1234,9 @@ class ViewerWidget(QWidget):
             # Reload the page to reflect annotation deletion
             self._reload_page(page_idx)
 
+            # Refresh annotations overlay to remove deleted highlight
+            self._refresh_annotations_for_page(page_idx)
+
             # Emit signal to notify sidebar update
             self.annotation_added.emit()
 
@@ -1391,12 +1405,19 @@ class ViewerWidget(QWidget):
             self.scroll_area.ensureWidgetVisible(page_label, 50, 50)
 
     def _on_wheel_event(self, event):
-        """Handle wheel event for Ctrl+scroll zooming (centered on viewport center)."""
+        """Handle wheel event for Ctrl+scroll zooming with mouse-centered anchor.
+
+        Core formula: S_new = (S_old + P_mouse) * (k_new / k_old) - P_mouse
+        Where:
+        - S_old: current scroll position
+        - P_mouse: mouse position in viewport
+        - k_old/k_new: old/new zoom factors
+        """
         if event.modifiers() & Qt.ControlModifier:
             if not self._doc:
                 return True
 
-            # Determine zoom factor
+            # Get zoom factor from wheel delta
             delta = event.angleDelta().y()
             if delta > 0:
                 factor = 1.2
@@ -1410,107 +1431,103 @@ class ViewerWidget(QWidget):
             new_zoom = old_zoom * factor
             new_zoom = max(0.1, min(5.0, new_zoom))
 
-            # Get viewport center
+            # Get current state
             viewport = self.scroll_area.viewport()
-            viewport_w = viewport.width()
-            viewport_h = viewport.height()
-            center_x = viewport_w // 2
-            center_y = viewport_h // 2
-
-            # Get current scroll position
             scrollbar_h = self.scroll_area.horizontalScrollBar()
             scrollbar_v = self.scroll_area.verticalScrollBar()
-            scroll_x = scrollbar_h.value()
-            scroll_y = scrollbar_v.value()
 
-            # Find which page contains the viewport center
-            center_global = viewport.mapToGlobal(QPoint(center_x, center_y))
-            container_center = self.pages_container.mapFromGlobal(center_global)
+            # Mouse position in viewport (anchor point)
+            mouse_x = event.pos().x()
+            mouse_y = event.pos().y()
 
-            # Find the page at center
-            center_page_idx = -1
-            center_page_label = None
-            for i, page_label in enumerate(self._page_labels):
-                if page_label.geometry().contains(container_center):
-                    center_page_idx = i
-                    center_page_label = page_label
-                    break
+            # Clamp to viewport bounds
+            mouse_x = max(0, min(mouse_x, viewport.width()))
+            mouse_y = max(0, min(mouse_y, viewport.height()))
 
-            if center_page_idx >= 0 and center_page_label:
-                # Calculate document coordinate at viewport center
-                t = self._compute_page_transform(center_page_label)
-                if t:
-                    old_scale = t["scale"]
-                    ox = t["offset_x"]
-                    oy = t["offset_y"]
-                    contents = t["contents"]
+            # Current scroll positions (as float for precision)
+            scroll_x = float(scrollbar_h.value())
+            scroll_y = float(scrollbar_v.value())
 
-                    # Page origin in container coordinates
-                    page_origin_x = contents.left() + ox
-                    page_origin_y = contents.top() + oy
+            # Calculate new scroll positions using the anchor formula
+            # S_new = (S_old + P_mouse) * ratio - P_mouse
+            zoom_ratio = new_zoom / old_zoom
+            new_scroll_x = (scroll_x + mouse_x) * zoom_ratio - mouse_x
+            new_scroll_y = (scroll_y + mouse_y) * zoom_ratio - mouse_y
 
-                    # Document coordinate at center (relative to page)
-                    doc_x = (container_center.x() - page_origin_x) / old_scale
-                    doc_y = (container_center.y() - page_origin_y) / old_scale
+            # Store target scroll positions for application after zoom
+            self._pending_zoom_scroll = {
+                'x': new_scroll_x,
+                'y': new_scroll_y
+            }
 
-                    # Store anchor data
-                    self._pending_zoom_anchor = {
-                        'page_idx': center_page_idx,
-                        'doc_x': doc_x,
-                        'doc_y': doc_y,
-                        'center_x': center_x,
-                        'center_y': center_y,
-                        'new_zoom': new_zoom
-                    }
-
-            # Apply zoom
+            # Apply zoom factor
             self._doc.zoom_factor = new_zoom
+
+            # Reload pages - this updates page sizes and scrollbar ranges
             self._reload_all_pages()
+
+            # Emit zoom changed signal
             self.zoom_changed.emit(new_zoom)
 
             return True
         return False
 
     def _apply_zoom_anchor(self):
-        """Apply zoom anchor to maintain viewport center."""
-        if not hasattr(self, '_pending_zoom_anchor') or not self._pending_zoom_anchor:
+        """Apply the calculated scroll position after zoom and page reload."""
+        if not hasattr(self, '_pending_zoom_scroll') or self._pending_zoom_scroll is None:
             return
 
-        anchor = self._pending_zoom_anchor
-        self._pending_zoom_anchor = None
+        anchor = self._pending_zoom_scroll
+        self._pending_zoom_scroll = None
 
-        page_idx = anchor['page_idx']
-        if page_idx >= len(self._page_labels):
-            return
-
-        page_label = self._page_labels[page_idx]
-        t = self._compute_page_transform(page_label)
-        if not t:
-            return
-
-        new_scale = t["scale"]
-        ox = t["offset_x"]
-        oy = t["offset_y"]
-        contents = t["contents"]
-
-        # Calculate where the document point should be after zoom
-        # We want the document point to be at viewport center
-        # scroll = doc_coord * scale + page_origin - viewport_center
         scrollbar_h = self.scroll_area.horizontalScrollBar()
         scrollbar_v = self.scroll_area.verticalScrollBar()
 
-        # Calculate new scroll position
-        new_scroll_x = int(anchor['doc_x'] * new_scale + contents.left() + ox - anchor['center_x'])
-        new_scroll_y = int(anchor['doc_y'] * new_scale + contents.top() + oy - anchor['center_y'])
+        # Get current scroll bar ranges after pages have been resized
+        h_max = scrollbar_h.maximum()
+        v_max = scrollbar_v.maximum()
 
-        # Apply scroll position
-        scrollbar_h.setValue(max(0, min(scrollbar_h.maximum(), new_scroll_x)))
-        scrollbar_v.setValue(max(0, min(scrollbar_v.maximum(), new_scroll_y)))
+        # Get viewport size
+        viewport = self.scroll_area.viewport()
+        viewport_h = viewport.height()
+
+        # Get pages container size
+        container_h = self.pages_container.height()
+
+        # Calculate target scroll positions
+        target_x = anchor['x']
+        target_y = anchor['y']
+
+        # For zoom out (ratio < 1), the document shrinks
+        # If document is smaller than viewport, center it
+        if container_h < viewport_h:
+            # Document fits in viewport, center it vertically
+            target_y = -(viewport_h - container_h) / 2
+        else:
+            # Document larger than viewport, ensure target is within bounds
+            target_y = max(0, min(v_max, target_y))
+
+        # Horizontal: always clamp to bounds
+        target_x = max(0, min(h_max, target_x))
+
+        # Apply with rounding
+        new_x = int(round(target_x))
+        new_y = int(round(target_y))
+
+        # Only set if different from current (avoid unnecessary updates)
+        if abs(scrollbar_h.value() - new_x) > 1:
+            scrollbar_h.setValue(new_x)
+        if abs(scrollbar_v.value() - new_y) > 1:
+            scrollbar_v.setValue(new_y)
 
     def _reload_all_pages(self):
         """Reload all pages with current zoom factor."""
         if not self._doc or not self._doc.doc:
             return
+
+        # Increment render version to invalidate stale renders
+        self._zoom_render_version += 1
+        render_version = self._zoom_render_version
 
         # Capture current zoom factor to ensure consistency
         current_zoom = self._doc.zoom_factor
@@ -1547,8 +1564,8 @@ class ViewerWidget(QWidget):
         # Refresh annotations
         self._refresh_annotations()
 
-        # Schedule remaining pages with zoom check
-        QTimer.singleShot(50, lambda: self._reload_remaining_pages(current_zoom))
+        # Schedule remaining pages with render version check
+        QTimer.singleShot(50, lambda: self._reload_remaining_pages(current_zoom, render_version))
 
     def _get_visible_page_indices(self):
         """Get indices of pages currently visible in viewport."""
@@ -1569,13 +1586,13 @@ class ViewerWidget(QWidget):
 
         return visible_indices
 
-    def _reload_remaining_pages(self, expected_zoom: float):
+    def _reload_remaining_pages(self, expected_zoom: float, render_version: int):
         """Reload pages that are not currently visible."""
         if not self._doc or not self._doc.doc:
             return
 
-        # If zoom has changed since scheduling, skip this render
-        if abs(self._doc.zoom_factor - expected_zoom) > 0.01:
+        # Skip if a newer zoom render has been scheduled
+        if render_version != self._zoom_render_version:
             return
 
         visible_pages = set(self._get_visible_page_indices())
@@ -1594,3 +1611,62 @@ class ViewerWidget(QWidget):
             self._reload_all_pages()
             # Emit signal to notify main window
             self.zoom_changed.emit(new_zoom)
+
+    def get_current_page(self) -> int:
+        """Get the page with maximum visible area in viewport.
+
+        Returns:
+            Page index (0-based) of the page with largest visible area.
+            Returns 0 if no document or no visible pages.
+        """
+        if not self._doc or not self._doc.doc:
+            return 0
+
+        if not self._page_labels:
+            return 0
+
+        viewport = self.scroll_area.viewport()
+        viewport_rect = viewport.rect()
+        viewport_height = viewport_rect.height()
+
+        # Get scroll positions to convert to document coordinates
+        scroll_y = self.scroll_area.verticalScrollBar().value()
+
+        max_visible_area = 0
+        current_page = 0
+
+        for i, page_label in enumerate(self._page_labels):
+            if i >= self._doc.page_count:
+                break
+
+            # Get page geometry (relative to pages_container)
+            page_geo = page_label.geometry()
+            page_top = page_geo.top()
+            page_bottom = page_geo.bottom()
+            page_height = page_geo.height()
+            page_width = page_geo.width()
+
+            # Calculate visible intersection in document coordinates
+            # Viewport spans from scroll_y to scroll_y + viewport_height
+            visible_top = max(page_top, scroll_y)
+            visible_bottom = min(page_bottom, scroll_y + viewport_height)
+            visible_height = max(0, visible_bottom - visible_top)
+
+            # Calculate visible area
+            visible_area = visible_height * page_width
+
+            if visible_area > max_visible_area:
+                max_visible_area = visible_area
+                current_page = i
+
+        return current_page
+
+    def get_page_count(self) -> int:
+        """Get total page count.
+
+        Returns:
+            Total number of pages in the document.
+        """
+        if not self._doc or not self._doc.doc:
+            return 0
+        return self._doc.page_count
