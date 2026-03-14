@@ -40,7 +40,7 @@ from pdfviewer.services.annotation_service import AnnotationService
 from pdfviewer.services.search_service import SearchService
 from pdfviewer.services.thumbnail_service import ThumbnailService
 from pdfviewer.services.print_service import PrintService
-from pdfviewer.workers.toc_worker import AutoTocWorker
+from pdfviewer.workers import TocWorkerFactory
 from pdfviewer.ui.annotation_tooltip import AnnotationTooltip
 
 
@@ -157,6 +157,8 @@ class MainWindow(QMainWindow):
         self.toc_widget = QTreeWidget()
         self.toc_widget.setHeaderLabel("目录")
         self.toc_widget.itemClicked.connect(self._on_toc_clicked)
+        self.toc_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.toc_widget.customContextMenuRequested.connect(self._show_toc_context_menu)
         self.sidebar_stack.addWidget(self.toc_widget)
 
         # 2. 注释视图
@@ -285,6 +287,18 @@ class MainWindow(QMainWindow):
             self._sidebar_visible = True
             # 侧边栏显示后，延迟重新应用适应模式
             QTimer.singleShot(100, self._reapply_auto_fit_if_needed)
+
+        # 如果切换到目录视图，重新应用折叠状态
+        if index == 0:
+            QTimer.singleShot(50, self._collapse_toc_to_l1)
+
+    def _collapse_toc_to_l1(self):
+        """折叠目录到L1层级"""
+        self.toc_widget.collapseAll()
+        for i in range(self.toc_widget.topLevelItemCount()):
+            item = self.toc_widget.topLevelItem(i)
+            if item:
+                item.setExpanded(True)
 
     def _toggle_sidebar_with_toc(self):
         """切换侧边栏显示/隐藏（显示目录）"""
@@ -455,6 +469,14 @@ class MainWindow(QMainWindow):
         find_action.setShortcutContext(Qt.ApplicationShortcut)
         find_action.triggered.connect(self._show_search_widget)
 
+        # 自动生成目录
+        auto_toc_action = tools_menu.addAction("自动生成目录(&A)...")
+        auto_toc_action.triggered.connect(self._show_auto_toc_dialog)
+
+        # 清除全部目录
+        clear_toc_action = tools_menu.addAction("清除全部目录(&C)")
+        clear_toc_action.triggered.connect(self._clear_all_toc)
+
         # 帮助菜单
         help_menu = menubar.addMenu("帮助(&H)")
 
@@ -528,6 +550,8 @@ class MainWindow(QMainWindow):
 
         settings.setValue("window/geometry", geometry)
         settings.setValue("window/state", state)
+        settings.setValue("view/auto_fit_on_open", self._auto_fit_on_open)
+        settings.setValue("view/auto_fit_mode", self._auto_fit_mode)
         settings.sync()  # 强制立即写入磁盘
 
         # 验证是否保存成功
@@ -562,7 +586,22 @@ class MainWindow(QMainWindow):
         if geometry is None:
             print("[DEBUG] 未找到保存的配置，使用默认值")
             self.resize(1200, 800)
-            self.move(100, 100)
+
+        # 恢复自动适应设置
+        self._auto_fit_on_open = settings.value("view/auto_fit_on_open", True)
+        self._auto_fit_mode = settings.value("view/auto_fit_mode", "fit_page")
+        # 确保类型正确
+        if isinstance(self._auto_fit_on_open, str):
+            self._auto_fit_on_open = self._auto_fit_on_open.lower() == "true"
+        print(f"[DEBUG] 自动适应设置: on_open={self._auto_fit_on_open}, mode={self._auto_fit_mode}")
+
+        # 更新菜单状态以反映恢复的设置
+        if hasattr(self, '_auto_fit_action'):
+            self._auto_fit_action.setChecked(self._auto_fit_on_open)
+        if hasattr(self, '_fit_page_action'):
+            self._fit_page_action.setChecked(self._auto_fit_mode == "fit_page")
+        if hasattr(self, '_fit_width_action'):
+            self._fit_width_action.setChecked(self._auto_fit_mode == "fit_width")
 
     def _add_welcome_tab(self):
         """添加欢迎页标签"""
@@ -570,10 +609,36 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(welcome)
         layout.setAlignment(Qt.AlignCenter)
 
-        label = QLabel("<h1>Unipdf</h1><p>极简、极速的 PDF 查看器</p>"
-                      "<p>拖拽 PDF 文件到窗口或按 Ctrl+O 打开文件</p>")
+        label = QLabel("<h1>Unipdf</h1><p>极简、极速的 PDF 查看器</p>")
         label.setAlignment(Qt.AlignCenter)
         layout.addWidget(label)
+
+        # 添加打开文件按钮
+        open_btn = QPushButton("📂 打开文件")
+        open_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 16px;
+                padding: 12px 24px;
+                margin: 10px;
+                border: 2px solid #0078d4;
+                border-radius: 6px;
+                background: #0078d4;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #106ebe;
+            }
+            QPushButton:pressed {
+                background: #005a9e;
+            }
+        """)
+        open_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        open_btn.clicked.connect(self.open_document)
+        layout.addWidget(open_btn, alignment=Qt.AlignCenter)
+
+        hint_label = QLabel("<p style='color: gray;'>拖拽 PDF 文件到窗口 或 按 Ctrl+O 打开</p>")
+        hint_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(hint_label)
 
         self.tab_widget.addTab(welcome, "欢迎")
         self.current_doc = None
@@ -612,9 +677,6 @@ class MainWindow(QMainWindow):
 
             # current_doc 已在 _create_document_tab 中设置
             # _on_tab_changed 会被 setCurrentIndex 触发，无需重复设置
-
-            # 生成目录
-            self._generate_toc(file_path)
 
             self._update_sidebar_for_current_tab()
 
@@ -703,15 +765,6 @@ class MainWindow(QMainWindow):
             # 使用更长的延迟确保页面完全渲染（包括异步渲染）
             QTimer.singleShot(300, self._display_search_results_on_pages)
 
-    def _generate_toc(self, file_path: str):
-        """生成自动目录"""
-        if self._toc_worker and self._toc_worker.isRunning():
-            self._toc_worker.stop()
-
-        self._toc_worker = AutoTocWorker(file_path)
-        self._toc_worker.finished.connect(self._on_toc_finished)
-        self._toc_worker.start()
-
     def _on_toc_finished(self, toc_list):
         """目录生成完成"""
         self.toc_widget.clear()
@@ -742,7 +795,139 @@ class MainWindow(QMainWindow):
                     self.toc_widget.addTopLevelItem(item)
                 stack.append(item)
 
-        self.toc_widget.expandAll()
+        # 只展开顶层项目（L1），折叠L2及以下
+        self._collapse_toc_to_l1()
+
+    def _show_auto_toc_dialog(self):
+        """显示自动目录生成对话框"""
+        if not self.current_doc or not hasattr(self.current_doc, '_doc'):
+            QMessageBox.warning(self, "提示", "请先打开 PDF 文件")
+            return
+
+        from PyQt5.QtWidgets import QDialog, QComboBox, QVBoxLayout, QLabel, QHBoxLayout
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("自动生成目录")
+        dialog.setMinimumWidth(300)
+
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("选择文档类型："))
+
+        doc_type_combo = QComboBox()
+        doc_type_combo.addItem("国家标准 (GB/T)", "gbt")
+        doc_type_combo.addItem("法律法规", "legal")
+
+        # 恢复上次选择的文档类型
+        settings = QSettings(QSettings.IniFormat, QSettings.UserScope, "Unipdf", "Unipdf")
+        last_doc_type = settings.value("toc/last_doc_type", "gbt")
+        index = doc_type_combo.findData(last_doc_type)
+        if index >= 0:
+            doc_type_combo.setCurrentIndex(index)
+
+        layout.addWidget(doc_type_combo)
+
+        layout.addWidget(QLabel("此功能将分析文档结构并自动生成可折叠目录。"))
+        layout.addWidget(QLabel("分析过程在后台进行，不会阻塞界面。"))
+
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("开始分析")
+        cancel_btn = QPushButton("取消")
+
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        if dialog.exec_() == QDialog.Accepted:
+            doc_type = doc_type_combo.currentData()
+            # 保存文档类型选择
+            settings = QSettings(QSettings.IniFormat, QSettings.UserScope, "Unipdf", "Unipdf")
+            settings.setValue("toc/last_doc_type", doc_type)
+            self._start_auto_toc_generation(doc_type)
+
+    def _start_auto_toc_generation(self, doc_type: str):
+        """启动自动目录生成"""
+        if not self.current_doc or not hasattr(self.current_doc, 'file_path'):
+            return
+
+        file_path = self.current_doc.file_path
+
+        # 显示进度对话框
+        from PyQt5.QtWidgets import QProgressDialog
+        self._toc_progress_dialog = QProgressDialog(
+            "正在分析文档结构...", "取消", 0, 50, self
+        )
+        self._toc_progress_dialog.setWindowTitle("生成目录")
+        self._toc_progress_dialog.setWindowModality(Qt.WindowModal)
+
+        # 停止现有工作线程
+        if self._toc_worker and self._toc_worker.isRunning():
+            self._toc_worker.stop()
+
+        # 创建新的工作线程
+        self._toc_worker = TocWorkerFactory.create(doc_type, file_path)
+        if not self._toc_worker:
+            QMessageBox.warning(self, "错误", f"不支持的文档类型: {doc_type}")
+            return
+        self._toc_worker.progress.connect(self._on_toc_progress)
+        self._toc_worker.finished.connect(self._on_auto_toc_finished)
+        self._toc_worker.error.connect(self._on_toc_error)
+
+        self._toc_progress_dialog.canceled.connect(self._toc_worker.stop)
+
+        self._toc_worker.start()
+
+    def _on_toc_progress(self, current: int, total: int):
+        """目录生成进度更新"""
+        if hasattr(self, '_toc_progress_dialog') and self._toc_progress_dialog:
+            self._toc_progress_dialog.setMaximum(total)
+            self._toc_progress_dialog.setValue(current)
+            self._toc_progress_dialog.setLabelText(
+                f"正在分析文档结构... ({current}/{total})"
+            )
+
+    def _on_auto_toc_finished(self, toc_list: list):
+        """自动目录生成完成"""
+        if hasattr(self, '_toc_progress_dialog') and self._toc_progress_dialog:
+            self._toc_progress_dialog.close()
+
+        if not toc_list:
+            QMessageBox.information(self, "完成", "未检测到有效的章节结构")
+            return
+
+        # 应用到文档
+        try:
+            if hasattr(self.current_doc, '_doc') and self.current_doc._doc:
+                self.current_doc._doc.set_toc(toc_list)
+                # 标记文档已修改
+                if hasattr(self.current_doc, 'is_modified'):
+                    self.current_doc.is_modified = True
+
+            # 刷新目录显示
+            self._on_toc_finished(toc_list)
+
+            # 展开侧边栏并切换到目录视图
+            if not self._sidebar_visible:
+                self._toggle_sidebar()
+            self._switch_sidebar_view(0)
+
+            QMessageBox.information(
+                self, "完成",
+                f"成功生成目录，共 {len(toc_list)} 个条目（未保存）"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存目录失败:\n{str(e)}")
+
+    def _on_toc_error(self, error_msg: str):
+        """目录生成错误"""
+        if hasattr(self, '_toc_progress_dialog') and self._toc_progress_dialog:
+            self._toc_progress_dialog.close()
+        QMessageBox.critical(self, "错误", f"目录生成失败:\n{error_msg}")
 
     def save_document(self):
         """保存当前文档"""
@@ -870,6 +1055,46 @@ class MainWindow(QMainWindow):
         if not doc:
             return
 
+        # 更新目录
+        self.toc_widget.clear()
+        try:
+            toc = doc.get_toc()
+            if toc:
+                stack = []
+                for level, title, page_num in toc:
+                    page_index = page_num - 1
+                    item = QTreeWidgetItem()
+                    item.setText(0, title)
+                    item.setToolTip(0, title)
+                    item.setData(0, Qt.UserRole, page_index)
+
+                    if level == 1:
+                        self.toc_widget.addTopLevelItem(item)
+                        stack = [item]
+                    else:
+                        while len(stack) >= level:
+                            stack.pop()
+                        if stack:
+                            stack[-1].addChild(item)
+                        else:
+                            self.toc_widget.addTopLevelItem(item)
+                        stack.append(item)
+                # 只展开顶层项目（L1），折叠L2及以下
+                self.toc_widget.collapseAll()
+                for i in range(self.toc_widget.topLevelItemCount()):
+                    item = self.toc_widget.topLevelItem(i)
+                    if item:
+                        item.setExpanded(True)
+            else:
+                item = QTreeWidgetItem(self.toc_widget)
+                item.setText(0, "(无目录)")
+                item.setData(0, Qt.UserRole, -1)
+        except Exception as e:
+            print(f"加载目录失败: {e}")
+            item = QTreeWidgetItem(self.toc_widget)
+            item.setText(0, "(无目录)")
+            item.setData(0, Qt.UserRole, -1)
+
         # 更新注释列表
         self.annot_widget.clear()
         annots = self._get_annotations_from_doc(doc)
@@ -955,6 +1180,275 @@ class MainWindow(QMainWindow):
         page_idx = item.data(0, Qt.UserRole)
         if page_idx >= 0 and self.current_doc:
             self.current_doc.scroll_to_page(page_idx)
+
+    def _show_toc_context_menu(self, pos):
+        """显示目录上下文菜单"""
+        item = self.toc_widget.itemAt(pos)
+
+        menu = QMenu(self)
+
+        # 如果有选中项，显示删除选项
+        if item:
+            delete_action = menu.addAction("删除此条目")
+            delete_action.triggered.connect(lambda: self._delete_toc_item(item))
+            menu.addSeparator()
+
+        # 添加新条目选项
+        add_action = menu.addAction("添加目录条目...")
+        add_action.triggered.connect(self._show_add_toc_dialog)
+
+        menu.exec_(self.toc_widget.mapToGlobal(pos))
+
+    def _delete_toc_item(self, item: QTreeWidgetItem):
+        """删除单个目录条目"""
+        if not self.current_doc or not hasattr(self.current_doc, '_doc'):
+            return
+
+        doc = self.current_doc._doc.doc
+        if not doc:
+            return
+
+        # 获取当前目录
+        try:
+            toc = doc.get_toc()
+        except Exception:
+            return
+
+        if not toc:
+            return
+
+        # 获取要删除的条目的标题和页码
+        title_to_delete = item.text(0)
+        page_to_delete = item.data(0, Qt.UserRole)
+
+        # 在 TOC 中找到并删除该条目（同时删除其子条目）
+        new_toc = []
+        skip_level = None
+        for entry in toc:
+            level, title, page = entry
+            # 如果当前条目的标题和页码匹配，则跳过（删除）
+            if title == title_to_delete and page - 1 == page_to_delete:
+                skip_level = level
+                continue
+            # 如果正在跳过子条目，检查级别
+            if skip_level is not None:
+                if level > skip_level:
+                    continue  # 跳过子条目
+                else:
+                    skip_level = None  # 退出跳过模式
+            new_toc.append(entry)
+
+        # 更新文档目录
+        try:
+            doc.set_toc(new_toc)
+            self.current_doc._doc.mark_modified(True)
+            # 刷新目录显示
+            self._update_sidebar_for_current_tab()
+            self.statusBar().showMessage(f"已删除目录条目: {title_to_delete}", 3000)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"删除目录条目失败:\n{str(e)}")
+
+    def _show_add_toc_dialog(self):
+        """显示添加目录条目对话框"""
+        if not self.current_doc or not hasattr(self.current_doc, '_doc'):
+            QMessageBox.warning(self, "警告", "没有打开的文档")
+            return
+
+        doc = self.current_doc._doc.doc
+        if not doc:
+            return
+
+        # 获取当前页码
+        current_page = 1
+        if hasattr(self.current_doc, 'current_page_idx'):
+            current_page = self.current_doc.current_page_idx + 1
+
+        # 创建对话框
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QComboBox, QSpinBox, QPushButton
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("添加目录条目")
+        dialog.setMinimumWidth(350)
+
+        layout = QVBoxLayout(dialog)
+
+        # 标题输入
+        layout.addWidget(QLabel("标题:"))
+        title_edit = QLineEdit()
+        title_edit.setPlaceholderText("输入目录标题")
+        layout.addWidget(title_edit)
+
+        # 层级选择
+        layout.addWidget(QLabel("层级:"))
+        level_combo = QComboBox()
+        level_combo.addItem("L1 - 一级目录", 1)
+        level_combo.addItem("L2 - 二级目录", 2)
+        layout.addWidget(level_combo)
+
+        # 页码选择
+        layout.addWidget(QLabel("页码:"))
+        page_layout = QHBoxLayout()
+
+        use_current_btn = QPushButton("使用当前页")
+        use_current_btn.setCheckable(True)
+        use_current_btn.setChecked(True)
+
+        page_spin = QSpinBox()
+        page_spin.setMinimum(1)
+        page_spin.setMaximum(len(doc))
+        page_spin.setValue(current_page)
+        page_spin.setEnabled(False)
+
+        use_current_btn.toggled.connect(lambda checked: page_spin.setEnabled(not checked))
+        use_current_btn.toggled.connect(lambda checked: page_spin.setValue(current_page) if checked else None)
+
+        page_layout.addWidget(use_current_btn)
+        page_layout.addWidget(QLabel("或自定义:"))
+        page_layout.addWidget(page_spin)
+        page_layout.addStretch()
+        layout.addLayout(page_layout)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        cancel_btn = QPushButton("取消")
+
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+        if dialog.exec_() == QDialog.Accepted:
+            title = title_edit.text().strip()
+            if not title:
+                QMessageBox.warning(self, "警告", "标题不能为空")
+                return
+
+            level = level_combo.currentData()
+            page = current_page if use_current_btn.isChecked() else page_spin.value()
+
+            self._add_toc_entry(title, level, page)
+
+    def _extract_number_from_title(self, title: str) -> int:
+        """从标题中提取数字用于排序"""
+        import re
+        # 尝试提取阿拉伯数字
+        numbers = re.findall(r'\d+', title)
+        if numbers:
+            return int(numbers[0])
+
+        # 尝试提取中文数字
+        cn_nums = {
+            '一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
+            '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
+            '百': 100, '千': 1000, '零': 0
+        }
+
+        # 匹配"第X章"、"第X条"等格式
+        match = re.search(r'第([一二三四五六七八九十百千零]+)[章节条款]', title)
+        if match:
+            cn_str = match.group(1)
+            result = 0
+            temp = 0
+            for char in cn_str:
+                if char in cn_nums:
+                    num = cn_nums[char]
+                    if num >= 10:
+                        if temp == 0:
+                            temp = 1
+                        result += temp * num
+                        temp = 0
+                    else:
+                        temp = temp * 10 + num if temp > 0 else num
+            result += temp
+            return result
+
+        # 尝试提取任意中文数字
+        for char in title:
+            if char in cn_nums and cn_nums[char] > 0:
+                return cn_nums[char]
+
+        return 0
+
+    def _add_toc_entry(self, title: str, level: int, page: int):
+        """添加目录条目并自动排序"""
+        if not self.current_doc or not hasattr(self.current_doc, '_doc'):
+            return
+
+        doc_wrapper = self.current_doc._doc
+        doc = doc_wrapper.doc
+        if not doc:
+            return
+
+        # 获取当前目录
+        try:
+            toc = doc.get_toc()
+        except Exception:
+            toc = []
+
+        # 添加新条目
+        new_entry = [level, title, page]
+        toc.append(new_entry)
+
+        # 排序：1. 页码 2. 层级 3. 数字大小
+        def sort_key(entry):
+            entry_level, entry_title, entry_page = entry
+            num = self._extract_number_from_title(entry_title)
+            return (entry_page, entry_level, num)
+
+        toc.sort(key=sort_key)
+
+        # 更新文档目录
+        try:
+            doc.set_toc(toc)
+            doc_wrapper.mark_modified(True)
+            # 刷新目录显示
+            self._update_sidebar_for_current_tab()
+            self.statusBar().showMessage(f"已添加目录条目: {title} (第{page}页)", 3000)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"添加目录条目失败:\n{str(e)}")
+
+    def _clear_all_toc(self):
+        """清除全部目录"""
+        if not self.current_doc or not hasattr(self.current_doc, '_doc'):
+            QMessageBox.warning(self, "警告", "没有打开的文档")
+            return
+
+        doc = self.current_doc._doc
+        if not doc or not doc.is_open():
+            QMessageBox.warning(self, "警告", "没有打开的文档")
+            return
+
+        # 确认对话框
+        reply = QMessageBox.question(
+            self,
+            "确认清除",
+            "确定要清除全部目录吗？\n此操作不可恢复。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            # 使用 save_with_toc 直接保存空目录（需要完整重写PDF文件）
+            # current_doc 是 ViewerWidget，需要通过 _doc 访问 PDFDocument
+            if hasattr(self.current_doc, '_doc') and self.current_doc._doc:
+                success = self.current_doc._doc.save_with_toc([])
+            else:
+                success = False
+            if success:
+                # 刷新目录显示
+                self._update_sidebar_for_current_tab()
+                self.statusBar().showMessage("已清除全部目录并保存", 3000)
+            else:
+                QMessageBox.critical(self, "错误", "清除目录失败")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"清除目录失败:\n{str(e)}")
 
     def _on_annot_clicked(self, item: QListWidgetItem):
         """注释点击"""
@@ -1483,6 +1977,9 @@ class MainWindow(QMainWindow):
     def _toggle_auto_fit_on_open(self, checked: bool):
         """Toggle auto-fit on open setting."""
         self._auto_fit_on_open = checked
+        # 保存设置
+        settings = QSettings(QSettings.IniFormat, QSettings.UserScope, "Unipdf", "Unipdf")
+        settings.setValue("view/auto_fit_on_open", checked)
 
     def _set_auto_fit_mode(self, mode: str):
         """Set auto-fit mode.
@@ -1494,6 +1991,9 @@ class MainWindow(QMainWindow):
         # Update menu check states
         self._fit_page_action.setChecked(mode == "fit_page")
         self._fit_width_action.setChecked(mode == "fit_width")
+        # 保存设置
+        settings = QSettings(QSettings.IniFormat, QSettings.UserScope, "Unipdf", "Unipdf")
+        settings.setValue("view/auto_fit_mode", mode)
 
     def _set_and_apply_auto_fit_mode(self, mode: str):
         """Set auto-fit mode and apply to current document immediately.

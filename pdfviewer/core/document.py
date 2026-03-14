@@ -116,11 +116,13 @@ class PDFDocument:
             return False
 
         try:
+            # 尝试增量保存（适用于小修改）
             self._doc.save(path, incremental=True)
             self._modified = False
             return True
         except Exception as e:
             error_msg = str(e).lower()
+            # 增量保存失败时（如加密文档），尝试完整重写
             if "incremental" in error_msg or "encryption" in error_msg:
                 try:
                     import shutil
@@ -131,6 +133,41 @@ class PDFDocument:
                     return True
                 except:
                     return False
+            return False
+
+    def save_with_toc(self, toc_list: list, file_path: Optional[str] = None) -> bool:
+        """
+        Save the document with TOC changes.
+
+        TOC修改需要完整重写PDF文件才能正确保存，增量保存无法处理TOC变更。
+
+        Args:
+            toc_list: The TOC list to set before saving
+            file_path: Optional path to save to (defaults to original path)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self._doc:
+            return False
+
+        path = file_path or self._file_path
+        if not path:
+            return False
+
+        try:
+            # 先设置TOC
+            self._doc.set_toc(toc_list)
+
+            # TOC修改需要完整保存（非增量）
+            import shutil
+            temp_path = path + ".tmp"
+            self._doc.save(temp_path)
+            shutil.move(temp_path, path)
+            self._modified = False
+            return True
+        except Exception as e:
+            print(f"Failed to save with TOC: {e}")
             return False
 
     @property
@@ -391,6 +428,27 @@ class PDFDocument:
             self._page_text_info.clear()
         elif page_idx in self._page_text_info:
             del self._page_text_info[page_idx]
+
+    def set_toc(self, toc_list: list) -> bool:
+        """
+        Set the table of contents (TOC) for the document.
+
+        Args:
+            toc_list: List of [level, title, page] entries
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self._doc:
+            return False
+
+        try:
+            self._doc.set_toc(toc_list)
+            self._modified = True
+            return True
+        except Exception as e:
+            print(f"Failed to set TOC: {e}")
+            return False
 
     def is_open(self) -> bool:
         """Check if a document is currently open."""
