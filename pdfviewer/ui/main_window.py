@@ -19,9 +19,9 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItem, QListWidget, QListWidgetItem,
     QLineEdit, QPushButton, QToolButton, QFrame,
     QStackedWidget, QSizePolicy, QShortcut, QMenu,
-    QProgressDialog, QInputDialog
+    QProgressDialog, QInputDialog, QActionGroup
 )
-from PyQt5.QtCore import Qt, QSize, QPoint, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QSize, QPoint, QTimer, pyqtSignal, QSettings
 from PyQt5.QtGui import (
     QDragEnterEvent, QDropEvent, QKeySequence,
     QCursor, QIcon
@@ -39,6 +39,7 @@ from pdfviewer.services.render_service import RenderService
 from pdfviewer.services.annotation_service import AnnotationService
 from pdfviewer.services.search_service import SearchService
 from pdfviewer.services.thumbnail_service import ThumbnailService
+from pdfviewer.services.print_service import PrintService
 from pdfviewer.workers.toc_worker import AutoTocWorker
 from pdfviewer.ui.annotation_tooltip import AnnotationTooltip
 
@@ -85,6 +86,10 @@ class MainWindow(QMainWindow):
         self._zoom_timer.setSingleShot(True)
         self._target_zoom = 1.0
 
+        # Auto-fit configuration
+        self._auto_fit_on_open = True  # 打开时自动适应
+        self._auto_fit_mode = "fit_page"  # 默认适应模式: fit_page, fit_width
+
         # 初始化界面
         self._init_ui()
 
@@ -112,7 +117,11 @@ class MainWindow(QMainWindow):
         # TOC worker
         self._toc_worker = None
 
-        # Note: _page_label is already initialized in _init_ui()
+        # Print service
+        self._print_service = PrintService(self)
+
+        # 恢复窗口几何信息
+        self._restore_window_geometry()
 
     def _init_ui(self):
         """初始化用户界面 - 左右分割布局"""
@@ -274,6 +283,8 @@ class MainWindow(QMainWindow):
         if not self._sidebar_visible:
             self.sidebar_container.setVisible(True)
             self._sidebar_visible = True
+            # 侧边栏显示后，延迟重新应用适应模式
+            QTimer.singleShot(100, self._reapply_auto_fit_if_needed)
 
     def _toggle_sidebar_with_toc(self):
         """切换侧边栏显示/隐藏（显示目录）"""
@@ -281,8 +292,16 @@ class MainWindow(QMainWindow):
             # 直接关闭侧边栏
             self.sidebar_container.setVisible(False)
             self._sidebar_visible = False
+            # 侧边栏关闭后，延迟重新应用适应模式
+            QTimer.singleShot(100, self._reapply_auto_fit_if_needed)
         else:
             self._switch_sidebar_view(0)
+
+    def _reapply_auto_fit_if_needed(self):
+        """如果当前是适应宽度模式，重新应用以适应新的视口大小"""
+        if self.current_doc and hasattr(self.current_doc, 'auto_fit_to_window'):
+            if self._auto_fit_mode in ("fit_width", "fit_page"):
+                self.current_doc.auto_fit_to_window(self._auto_fit_mode)
 
     def _init_search_widget(self, main_layout):
         """初始化搜索框"""
@@ -356,6 +375,13 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        print_action = file_menu.addAction("打印(&P)...")
+        print_action.setShortcut("Ctrl+P")
+        print_action.setShortcutContext(Qt.ApplicationShortcut)
+        print_action.triggered.connect(self.print_document)
+
+        file_menu.addSeparator()
+
         exit_action = file_menu.addAction("退出(&X)")
         exit_action.setShortcut("Ctrl+Q")
         exit_action.setShortcutContext(Qt.ApplicationShortcut)
@@ -386,6 +412,41 @@ class MainWindow(QMainWindow):
         zoom_reset_action.setShortcutContext(Qt.ApplicationShortcut)
         zoom_reset_action.triggered.connect(self.zoom_reset)
 
+        view_menu.addSeparator()
+
+        # 自动适应菜单
+        self._auto_fit_action = view_menu.addAction("打开时自动适应")
+        self._auto_fit_action.setCheckable(True)
+        self._auto_fit_action.setChecked(self._auto_fit_on_open)
+        self._auto_fit_action.triggered.connect(self._toggle_auto_fit_on_open)
+
+        # 适应模式子菜单
+        fit_mode_menu = view_menu.addMenu("适应模式")
+
+        # 使用 QActionGroup 管理互斥选项
+        self._fit_mode_group = QActionGroup(self)
+        self._fit_mode_group.setExclusive(True)
+
+        self._fit_page_action = fit_mode_menu.addAction("整页适应")
+        self._fit_page_action.setCheckable(True)
+        self._fit_page_action.setChecked(self._auto_fit_mode == "fit_page")
+        self._fit_mode_group.addAction(self._fit_page_action)
+        self._fit_page_action.triggered.connect(lambda: self._set_and_apply_auto_fit_mode("fit_page"))
+
+        self._fit_width_action = fit_mode_menu.addAction("适应宽度")
+        self._fit_width_action.setCheckable(True)
+        self._fit_width_action.setChecked(self._auto_fit_mode == "fit_width")
+        self._fit_mode_group.addAction(self._fit_width_action)
+        self._fit_width_action.triggered.connect(lambda: self._set_and_apply_auto_fit_mode("fit_width"))
+
+        view_menu.addSeparator()
+
+        # 循环切换适应模式 (Ctrl+9)
+        cycle_fit_action = view_menu.addAction("循环切换适应模式(&C)")
+        cycle_fit_action.setShortcut("Ctrl+9")
+        cycle_fit_action.setShortcutContext(Qt.ApplicationShortcut)
+        cycle_fit_action.triggered.connect(self._cycle_auto_fit_mode)
+
         # 工具菜单
         tools_menu = menubar.addMenu("工具(&T)")
 
@@ -393,6 +454,28 @@ class MainWindow(QMainWindow):
         find_action.setShortcut("Ctrl+F")
         find_action.setShortcutContext(Qt.ApplicationShortcut)
         find_action.triggered.connect(self._show_search_widget)
+
+        # 帮助菜单
+        help_menu = menubar.addMenu("帮助(&H)")
+
+        about_action = help_menu.addAction("关于(&A)...")
+        about_action.triggered.connect(self._show_about_dialog)
+
+    def _show_about_dialog(self):
+        """显示关于对话框"""
+        from pdfviewer import __version__
+
+        QMessageBox.about(
+            self,
+            "关于 Unipdf",
+            f"""<h2>Unipdf</h2>
+<p><b>版本:</b> {__version__}</p>
+<p><b>描述:</b> 极简极速 PDF 查看器</p>
+<p>基于 PyQt5 和 PyMuPDF 构建</p>
+<p>采用模块化架构重构版本</p>
+<hr>
+<p>© 2024 Unipdf Team</p>"""
+        )
 
     def _init_shortcuts(self):
         """初始化额外的快捷键（不与菜单重复的）"""
@@ -432,6 +515,54 @@ class MainWindow(QMainWindow):
                 # 已到最新或没有历史，不循环，停在原地
                 return True
         return super().eventFilter(obj, event)
+
+    def _save_window_geometry(self):
+        """保存窗口几何信息到 QSettings."""
+        from PyQt5.QtCore import QSettings
+        settings = QSettings(QSettings.IniFormat, QSettings.UserScope, "Unipdf", "Unipdf")
+        geometry = self.saveGeometry()
+        state = self.saveState()
+
+        print(f"[DEBUG] 保存前 - geometry bytes: {len(geometry) if geometry else 0}")
+        print(f"[DEBUG] 保存前 - state bytes: {len(state) if state else 0}")
+
+        settings.setValue("window/geometry", geometry)
+        settings.setValue("window/state", state)
+        settings.sync()  # 强制立即写入磁盘
+
+        # 验证是否保存成功
+        test_geo = settings.value("window/geometry")
+        print(f"[DEBUG] 验证 - geometry 已保存: {test_geo is not None}")
+        print(f"[DEBUG] 窗口配置已保存到: {settings.fileName()}")
+
+    def _restore_window_geometry(self):
+        """从 QSettings 恢复窗口几何信息."""
+        from PyQt5.QtCore import QSettings
+        settings = QSettings(QSettings.IniFormat, QSettings.UserScope, "Unipdf", "Unipdf")
+        geometry = settings.value("window/geometry")
+        state = settings.value("window/state")
+
+        print(f"[DEBUG] 尝试从 {settings.fileName()} 恢复窗口配置")
+        print(f"[DEBUG] geometry: {geometry is not None}, state: {state is not None}")
+
+        # 处理不同类型（PyQt5 可能返回 QByteArray 或 str）
+        if geometry is not None:
+            if isinstance(geometry, str):
+                geometry = geometry.encode('utf-8')
+            self.restoreGeometry(geometry)
+            print("[DEBUG] 已恢复窗口几何")
+
+        if state is not None:
+            if isinstance(state, str):
+                state = state.encode('utf-8')
+            self.restoreState(state)
+            print("[DEBUG] 已恢复窗口状态")
+
+        # 如果没有保存的几何信息，使用默认大小
+        if geometry is None:
+            print("[DEBUG] 未找到保存的配置，使用默认值")
+            self.resize(1200, 800)
+            self.move(100, 100)
 
     def _add_welcome_tab(self):
         """添加欢迎页标签"""
@@ -512,6 +643,11 @@ class MainWindow(QMainWindow):
             viewer.annotation_added.connect(self._on_annotation_added)
             viewer.zoom_changed.connect(self._on_zoom_changed)
             viewer.document_loaded.connect(self._update_page_label)
+
+            # 应用自动适应（延迟执行，等待布局完成）
+            if self._auto_fit_on_open:
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(200, lambda v=viewer: self._apply_auto_fit_to_viewer(v))
 
             # 连接滚动信号以更新页码（使用防抖）
             viewer.scroll_area.verticalScrollBar().valueChanged.connect(
@@ -625,6 +761,41 @@ class MainWindow(QMainWindow):
                 return False
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存失败:\n{str(e)}")
+            return False
+
+    def print_document(self):
+        """打印当前文档"""
+        if not self.current_doc or not hasattr(self.current_doc, '_doc'):
+            QMessageBox.information(self, "提示", "请先打开一个PDF文档")
+            return False
+
+        try:
+            # Get the fitz document
+            doc = self.current_doc._doc.doc
+            if not doc:
+                QMessageBox.critical(self, "错误", "无法访问文档")
+                return False
+
+            # Get current page index
+            current_page = 0
+            if hasattr(self.current_doc, 'get_current_page'):
+                current_page = self.current_doc.get_current_page()
+
+            # Use print service to print the document
+            from pdfviewer.services.print_service import PrintRange
+            success = self._print_service.print_document(
+                doc,
+                page_range=PrintRange.ALL_PAGES,
+                current_page=current_page,
+                show_dialog=True
+            )
+
+            if success:
+                self.statusBar().showMessage("打印任务已发送", 3000)
+            return success
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打印失败:\n{str(e)}")
             return False
 
     def close_current_tab(self, idx: int = None):
@@ -1309,6 +1480,71 @@ class MainWindow(QMainWindow):
             from PyQt5.QtCore import QTimer
             QTimer.singleShot(150, lambda: self.current_doc.scroll_to_page(current_page))
 
+    def _toggle_auto_fit_on_open(self, checked: bool):
+        """Toggle auto-fit on open setting."""
+        self._auto_fit_on_open = checked
+
+    def _set_auto_fit_mode(self, mode: str):
+        """Set auto-fit mode.
+
+        Args:
+            mode: "fit_page", "fit_width", or "fit_height"
+        """
+        self._auto_fit_mode = mode
+        # Update menu check states
+        self._fit_page_action.setChecked(mode == "fit_page")
+        self._fit_width_action.setChecked(mode == "fit_width")
+
+    def _set_and_apply_auto_fit_mode(self, mode: str):
+        """Set auto-fit mode and apply to current document immediately.
+
+        Args:
+            mode: "fit_page" or "fit_width"
+        """
+        self._set_auto_fit_mode(mode)
+
+        # Apply immediately to current document
+        if self.current_doc and hasattr(self.current_doc, 'auto_fit_to_window'):
+            self.current_doc.auto_fit_to_window(mode)
+            mode_names = {
+                "fit_page": "整页适应",
+                "fit_width": "适应宽度"
+            }
+            mode_name = mode_names.get(mode, "整页适应")
+            zoom_percent = int(self.current_doc._doc.zoom_factor * 100)
+            self.statusBar().showMessage(f"已应用 {mode_name}: {zoom_percent}%", 2000)
+
+    def _cycle_auto_fit_mode(self):
+        """Cycle through fit modes: fit_page -> fit_width -> fit_page."""
+        # Define cycle order
+        modes = ["fit_page", "fit_width"]
+        # Get current index and move to next
+        try:
+            current_idx = modes.index(self._auto_fit_mode)
+        except ValueError:
+            current_idx = 0
+        next_idx = (current_idx + 1) % len(modes)
+        next_mode = modes[next_idx]
+        # Apply the next mode
+        self._set_and_apply_auto_fit_mode(next_mode)
+
+    def auto_fit_now(self):
+        """Apply auto-fit to current document immediately."""
+        if self.current_doc and hasattr(self.current_doc, 'auto_fit_to_window'):
+            self.current_doc.auto_fit_to_window(self._auto_fit_mode)
+            mode_names = {
+                "fit_page": "整页适应",
+                "fit_width": "适应宽度"
+            }
+            mode_name = mode_names.get(self._auto_fit_mode, "整页适应")
+            zoom_percent = int(self.current_doc._doc.zoom_factor * 100)
+            self.statusBar().showMessage(f"已应用 {mode_name}: {zoom_percent}%", 2000)
+
+    def _apply_auto_fit_to_viewer(self, viewer):
+        """Apply auto-fit to a specific viewer (used when opening documents)."""
+        if viewer and hasattr(viewer, 'auto_fit_to_window'):
+            viewer.auto_fit_to_window(self._auto_fit_mode)
+
     # ==================== 事件处理 ====================
 
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -1398,5 +1634,8 @@ class MainWindow(QMainWindow):
 
         if self._toc_worker and self._toc_worker.isRunning():
             self._toc_worker.stop()
+
+        # 保存窗口几何信息
+        self._save_window_geometry()
 
         event.accept()

@@ -13,7 +13,7 @@ Unipdf - 极简极速 PDF 查看器
 - utils   : 工具函数 (坐标转换, TOC模式)
 """
 
-__version__ = "2.0.0"
+__version__ = "1.1.0"
 __author__ = "Unipdf Team"
 
 # Convenience imports

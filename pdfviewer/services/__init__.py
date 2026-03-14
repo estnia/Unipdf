@@ -11,10 +11,12 @@ from .render_service import RenderService
 from .annotation_service import AnnotationService, AnnotationInfo
 from .search_service import SearchService, SearchMatch
 from .thumbnail_service import ThumbnailService
+from .print_service import PrintService, PrintRange
 
 __all__ = [
     'RenderService',
     'AnnotationService', 'AnnotationInfo',
     'SearchService', 'SearchMatch',
     'ThumbnailService',
+    'PrintService', 'PrintRange',
 ]

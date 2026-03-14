@@ -1670,3 +1670,46 @@ class ViewerWidget(QWidget):
         if not self._doc or not self._doc.doc:
             return 0
         return self._doc.page_count
+
+    def auto_fit_to_window(self, fit_mode: str = "fit_page"):
+        """Auto-adjust zoom to fit the window.
+
+        Args:
+            fit_mode: Fit mode
+                - "fit_page": Fit entire page (default)
+                - "fit_width": Fit to width
+        """
+        if not self._doc or not self._doc.doc:
+            return
+
+        # Get viewport size
+        viewport = self.scroll_area.viewport()
+        viewport_w = viewport.width()
+        viewport_h = viewport.height()
+
+        # Calculate DPI scale (same as in _reload_all_pages)
+        dpi_scale = self.logicalDpiX() / 96.0 if hasattr(self, 'logicalDpiX') else 1.0
+
+        # Calculate zoom factor (this is the base zoom, DPI scale will be applied during rendering)
+        base_zoom = self._doc.calculate_auto_fit_zoom(
+            viewport_w, viewport_h, fit_mode
+        )
+
+        # Adjust zoom to account for DPI scaling
+        # _reload_all_pages multiplies zoom by dpi_scale, so we need to divide by it here
+        new_zoom = base_zoom / dpi_scale if dpi_scale > 0 else base_zoom
+
+        # Adjust alignment based on fit mode
+        if fit_mode == "fit_width":
+            self.scroll_area.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            self.pages_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            self.pages_layout.setContentsMargins(5, 10, 5, 10)
+        else:
+            self.scroll_area.setAlignment(Qt.AlignCenter)
+            self.pages_layout.setAlignment(Qt.AlignCenter)
+            self.pages_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Apply zoom
+        self._doc.zoom_factor = new_zoom
+        self._reload_all_pages()
+        self.zoom_changed.emit(new_zoom)

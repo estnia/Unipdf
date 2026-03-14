@@ -37,7 +37,7 @@ def main():
     # Create application
     app = QApplication(sys.argv)
     app.setApplicationName("Unipdf")
-    app.setApplicationVersion("2.0")
+    app.setApplicationVersion("1.1.0")
     app.setOrganizationName("Unipdf")
 
     # Create main window

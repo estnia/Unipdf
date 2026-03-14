@@ -220,6 +220,59 @@ class PDFDocument:
         rect = page.rect
         return (rect.width, rect.height)
 
+    def calculate_auto_fit_zoom(self, viewport_width: int, viewport_height: int,
+                                fit_mode: str = "fit_page") -> float:
+        """
+        Calculate adaptive zoom factor to fit viewport.
+
+        Args:
+            viewport_width: Viewport width in pixels
+            viewport_height: Viewport height in pixels
+            fit_mode: Fit mode
+                - "fit_page": Fit entire page (default)
+                - "fit_width": Fit to width
+
+        Returns:
+            Calculated zoom factor
+        """
+        if not self._doc or self.page_count == 0:
+            return 1.0
+
+        # Get first page size (in points)
+        page_width_pts, page_height_pts = self.get_page_size(0)
+        if page_width_pts == 0 or page_height_pts == 0:
+            return 1.0
+
+        # Leave some margin for better visual effect
+        # Reserve scrollbar width (20px) to prevent layout oscillation
+        scrollbar_width = 20  # pixels
+        if fit_mode == "fit_width":
+            # For fit_width: use viewport width directly, no margin needed
+            # but reserve scrollbar width to prevent horizontal scrollbar
+            margin = scrollbar_width
+            available_width = max(10, viewport_width - margin)
+            available_height = max(10, viewport_height - margin)
+        else:
+            # For fit_page: larger margin for better visual
+            margin = 40
+            available_width = max(10, viewport_width - margin)
+            available_height = max(10, viewport_height - margin)
+
+        # Calculate zoom factor based on fit mode
+        if fit_mode == "fit_page":
+            # Fit entire page - use the smaller scale
+            scale_w = available_width / page_width_pts
+            scale_h = available_height / page_height_pts
+            zoom = min(scale_w, scale_h)
+        elif fit_mode == "fit_width":
+            # Fit to width only
+            zoom = available_width / page_width_pts
+        else:
+            zoom = 1.0
+
+        # Limit zoom range [0.1, 5.0]
+        return max(0.1, min(5.0, zoom))
+
     def load_page_text(self, page_idx: int) -> PageTextInfo:
         """
         Load text information for a page.
