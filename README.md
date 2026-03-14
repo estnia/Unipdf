@@ -11,6 +11,9 @@
 - **完整注释**: 高亮、下划线 + 悬停提示 + 右键删除
 - **平滑缩放**: 视口中心锚点缩放，支持连续缩放
 - **搜索历史**: 查找框支持上下键浏览历史记录
+- **窗口记忆**: 自动保存和恢复窗口大小、位置
+- **打印支持**: 完整打印功能，支持打印预览和页面范围选择
+- **自动适应**: 支持整页适应和适应宽度模式（Ctrl+9 快速切换）
 
 ## 技术栈
 
@@ -43,8 +46,9 @@
 - 页面缩略图视图（快速预览和跳转）
 - 注释列表侧边栏（显示所有注释，支持右键删除）
 - 搜索结果侧边栏（深色主题，高亮匹配词）
-- 翻页: PageUp/PageDown
+- 翻页: PageUp/PageDown/↑/↓
 - 首页/末页: Home/End 键
+- 侧边栏显示/隐藏: F9 或 Ctrl+D 键
 - 侧边栏显示/隐藏: F9 键
 
 ✅ **搜索功能**
@@ -77,11 +81,11 @@
 - 注释列表显示所有注释
 - 缩放后注释位置正确保持
 
-✅ **其他功能**
-- 最近打开文件列表
-- 导出当前页为图片
-- 文件拖放打开
-- 命令行参数打开文件
+✅ **视图功能**
+- 窗口大小和位置自动记忆（重启后恢复）
+- 适应宽度模式 / 整页适应模式（Ctrl+9 循环切换）
+- 打开时自动适应（可开关）
+- 侧边栏宽度自适应
 
 ## 安装
 
@@ -89,10 +93,10 @@
 
 ```bash
 # 下载 release 页面的 .deb 包
-wget https://github.com/estnia/Unipdf/releases/download/v1.0.0/unipdf-deps_1.0.0_amd64.deb
+wget https://github.com/estnia/Unipdf/releases/download/v1.1.0/unipdf_1.1.0_amd64.deb
 
 # 一键安装依赖
-sudo dpkg -i unipdf-deps_1.0.0_amd64.deb
+sudo dpkg -i unipdf_1.1.0_amd64.deb
 
 # 如有依赖问题，自动修复
 sudo apt-get install -f
@@ -117,24 +121,7 @@ pip3 install pymupdf==1.21.1 pyqt5==5.15.9
 python3 main.py
 ```
 
-### 方案 3: 离线安装（无网络环境）
-
-详见 [OFFLINE_INSTALL.md](OFFLINE_INSTALL.md)
-
-```bash
-# 在联网机器下载依赖
-bash download_offline_deps.sh
-
-# 复制到离线机器
-scp unipdf-offline-deps-*.tar.gz user@offline:/path/
-
-# 在离线机器安装
-tar -xzf unipdf-offline-deps-*.tar.gz
-cd unipdf-offline-deps-*/
-./install.sh
-```
-
-### 方案 4: 无图形界面环境（Xvfb）
+### 方案 3: 无图形界面环境（Xvfb）
 
 适用于服务器、CI/CD 环境或没有物理显示器的场景。
 
@@ -169,7 +156,9 @@ python3 main.py /path/to/document.pdf
 | `F3` | 查找下一个 |
 | `Shift + F3` | 查找上一个 |
 | `Escape` | 隐藏搜索框 |
-| `F9` | 显示/隐藏侧边栏 |
+| `Ctrl + D` | 显示/隐藏侧边栏 |
+| `Ctrl + 9` | 循环切换适应模式（整页/宽度）|
+| `Ctrl + P` | 打印 |
 | `PageUp` / `↑` | 上一页 |
 | `PageDown` / `↓` | 下一页 |
 | `Home` | 跳到第一页 |
@@ -192,11 +181,7 @@ Unipdf/
 ├── main_original.py           # 原始单文件版本（参考）
 ├── requirements.txt           # Python 依赖
 ├── README.md                  # 项目说明
-├── OFFLINE_INSTALL.md         # 离线安装说明
 ├── CLAUDE.md                  # 开发规范
-├── build_deb_package.sh       # Debian 包构建脚本
-├── build_offline_package.sh   # 离线包构建脚本
-├── download_offline_deps.sh   # 依赖下载脚本
 ├── wheels/                    # 预编译 wheel 文件
 │   ├── PyMuPDF-*.whl
 │   ├── PyQt5-*.whl
@@ -208,6 +193,7 @@ Unipdf/
 │   │   └── text_engine.py     # 文本处理
 │   ├── services/              # 服务层
 │   │   ├── annotation_service.py
+│   │   ├── print_service.py   # 打印服务
 │   │   ├── render_service.py
 │   │   ├── search_service.py
 │   │   └── thumbnail_service.py
@@ -235,6 +221,8 @@ Unipdf/
 5. **智能目录**: 支持法律条文、国家标准等文档的目录自动识别
 6. **PyMuPDF 兼容**: 代码兼容新旧版本 PyMuPDF（`import fitz` 和 `import pymupdf`）
 7. **缩放稳定性**: 缩放时使用视口中心作为锚点，配合防抖定时器，确保连续缩放时渲染正确
+8. **DPI 自适应**: 正确处理高 DPI 显示器的缩放比例，确保适应宽度/整页适应模式精确填充视口
+9. **窗口记忆**: 使用 QSettings 持久化窗口几何信息，跨会话保持用户布局偏好
 
 ## 开发计划
 
@@ -247,11 +235,12 @@ Unipdf/
 - [x] 模块化架构重构
 - [x] 离线安装包（.deb）
 - [x] 搜索历史功能
+- [x] 窗口大小位置记忆
+- [x] 打印支持
 - [ ] 最近打开文件列表
 - [ ] 全屏模式
 - [ ] 连续滚动模式
 - [ ] 夜间模式/护眼模式
-- [ ] 打印支持
 - [ ] PDF 导出/转换
 
 ## 许可证
@@ -264,5 +253,5 @@ estnia
 
 ---
 
-**版本**: v1.0.0
-**更新日期**: 2026-03-11
+**版本**: v1.1.0
+**更新日期**: 2026-03-14
