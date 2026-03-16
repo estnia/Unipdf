@@ -17,6 +17,8 @@ try:
 except ImportError:
     import pymupdf as fitz  # PyMuPDF >= 1.23
 
+from pdfviewer.utils.lru_cache import LRUCache
+
 
 @dataclass
 class PageTextInfo:
@@ -42,8 +44,8 @@ class PDFDocument:
         self._zoom_factor: float = 1.0
         self._modified: bool = False
 
-        # Text information cache
-        self._page_text_info: Dict[int, PageTextInfo] = {}
+        # Text information cache with LRU eviction (max 50 pages)
+        self._page_text_info: LRUCache[PageTextInfo] = LRUCache(maxsize=50)
 
         if file_path:
             self.open(file_path)
@@ -426,8 +428,8 @@ class PDFDocument:
         """
         if page_idx is None:
             self._page_text_info.clear()
-        elif page_idx in self._page_text_info:
-            del self._page_text_info[page_idx]
+        else:
+            self._page_text_info.pop(page_idx, None)
 
     def set_toc(self, toc_list: list) -> bool:
         """

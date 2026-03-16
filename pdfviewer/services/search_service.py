@@ -19,29 +19,24 @@ except ImportError:
     import pymupdf as fitz  # PyMuPDF >= 1.23
 
 from pdfviewer.core.document import PDFDocument
-
-
-@dataclass
-class SearchMatch:
-    """A single search match result."""
-    page_idx: int
-    char_start: int
-    char_end: int
-    context: str
-    matched_text: str
+from pdfviewer.workers.async_search_worker import AsyncSearchWorker, SearchMatch
 
 
 class SearchService(QObject):
     """
     Service for full-text search in PDF documents.
 
-    Provides search functionality with context extraction and
-    result navigation.
+    Provides both synchronous and asynchronous search functionality
+    with context extraction and result navigation.
     """
 
     search_completed = pyqtSignal(int)  # Number of results found
+    search_progress = pyqtSignal(int, int)  # current_page, total_pages (async only)
+    search_result = pyqtSignal(object)  # SearchMatch found (async only)
     result_selected = pyqtSignal(int, int, int)  # page_idx, char_start, char_end
     search_cleared = pyqtSignal()
+    search_error = pyqtSignal(str)
+    search_cancelled = pyqtSignal()
 
     def __init__(self, parent=None):
         """Initialize search service."""
@@ -50,6 +45,8 @@ class SearchService(QObject):
         self._results: List[SearchMatch] = []
         self._current_index: int = -1
         self._last_query: str = ""
+        self._async_worker: Optional[AsyncSearchWorker] = None
+        self._is_searching: bool = False
 
     def set_document(self, document: Optional[PDFDocument]):
         """Set the current document."""
@@ -274,3 +271,80 @@ class SearchService(QObject):
     def get_last_query(self) -> str:
         """Get the last search query."""
         return self._last_query
+
+    # ===== Async Search Methods =====
+
+    def search_async(self, query: str, case_sensitive: bool = False) -> bool:
+        """
+        Start asynchronous search across all pages.
+
+        Args:
+            query: Search query string
+            case_sensitive: Whether search is case-sensitive
+
+        Returns:
+            True if search started, False if no document
+        """
+        # Cancel any existing search
+        self.cancel_async_search()
+        self.clear_results()
+
+        if not self._document or not self._document.doc:
+            return False
+
+        if not query:
+            return False
+
+        self._last_query = query
+        self._is_searching = True
+
+        # Create and start worker
+        doc_path = self._document.file_path
+        if not doc_path:
+            return False
+
+        self._async_worker = AsyncSearchWorker(doc_path, query, case_sensitive)
+
+        # Connect signals
+        self._async_worker.search_progress.connect(self.search_progress)
+        self._async_worker.search_result.connect(self._on_async_result)
+        self._async_worker.search_completed.connect(self._on_async_completed)
+        self._async_worker.search_error.connect(self._on_async_error)
+        self._async_worker.search_cancelled.connect(self._on_async_cancelled)
+
+        self._async_worker.start()
+        return True
+
+    def _on_async_result(self, match: SearchMatch):
+        """Handle async search result."""
+        self._results.append(match)
+        self.search_result.emit(match)
+
+    def _on_async_completed(self, total_matches: int):
+        """Handle async search completion."""
+        self._is_searching = False
+        self._async_worker = None
+        self.search_completed.emit(total_matches)
+
+    def _on_async_error(self, error_msg: str):
+        """Handle async search error."""
+        self._is_searching = False
+        self._async_worker = None
+        self.search_error.emit(error_msg)
+
+    def _on_async_cancelled(self):
+        """Handle async search cancellation."""
+        self._is_searching = False
+        self._async_worker = None
+
+    def cancel_async_search(self):
+        """Cancel the ongoing async search."""
+        if self._async_worker and self._async_worker.isRunning():
+            self._async_worker.cancel()
+            self._async_worker.wait(500)
+        self._async_worker = None
+        self._is_searching = False
+
+    def is_searching(self) -> bool:
+        """Check if async search is in progress."""
+        return self._is_searching
