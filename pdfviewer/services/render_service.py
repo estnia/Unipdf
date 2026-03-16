@@ -12,6 +12,10 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtGui import QPixmap
 
 from pdfviewer.workers.render_worker import RenderWorker
+from pdfviewer.utils.lru_cache import NestedLRUCache, LRUCache
+from pdfviewer.services.memory_manager import (
+    MemoryManager, get_cache_config_by_memory
+)
 
 
 class RenderService(QObject):
@@ -26,11 +30,28 @@ class RenderService(QObject):
     render_error = pyqtSignal(int, str)  # page_idx, error_msg
 
     def __init__(self, parent=None):
-        """Initialize render service."""
+        """Initialize render service with dynamic cache configuration."""
         super().__init__(parent)
         self._active_workers: Dict[int, RenderWorker] = {}
-        self._l2_cache: Dict[int, Dict[int, QPixmap]] = {}  # zoom_percent -> {page_idx -> pixmap}
-        self._base_pixmaps: Dict[int, QPixmap] = {}
+
+        # 根据系统内存动态配置缓存
+        cache_config = get_cache_config_by_memory()
+
+        # L2 cache with LRU eviction: {zoom_percent: {page_idx -> pixmap}}
+        self._l2_cache = NestedLRUCache(
+            max_outer=cache_config['max_outer'],
+            max_inner=cache_config['max_inner']
+        )
+        # Base pixmap cache with LRU eviction
+        self._base_pixmaps = LRUCache(maxsize=cache_config['base_cache'])
+
+        # Memory manager for automatic cleanup
+        self._memory_manager = MemoryManager(
+            threshold_mb=800,
+            critical_mb=1500
+        )
+        self._memory_manager.add_cleanup_hook(self._on_memory_cleanup)
+
         self._doc_path: Optional[str] = None
 
     def set_document(self, doc_path: str):
@@ -68,11 +89,10 @@ class RenderService(QObject):
 
         # Check L2 cache
         zoom_percent = int(zoom * 100)
-        if zoom_percent in self._l2_cache:
-            if page_idx in self._l2_cache[zoom_percent]:
-                pixmap = self._l2_cache[zoom_percent][page_idx]
-                self.page_rendered.emit(page_idx, zoom_percent, dpi_scale, pixmap)
-                return
+        cached_pixmap = self._l2_cache.get(zoom_percent, page_idx)
+        if cached_pixmap is not None:
+            self.page_rendered.emit(page_idx, zoom_percent, dpi_scale, cached_pixmap)
+            return
 
         # Create and start worker
         worker = RenderWorker(
@@ -103,21 +123,15 @@ class RenderService(QObject):
 
     def _add_to_cache(self, page_idx: int, zoom_percent: int, pixmap: QPixmap):
         """Add rendered pixmap to L2 cache."""
-        if zoom_percent not in self._l2_cache:
-            self._l2_cache[zoom_percent] = {}
-        self._l2_cache[zoom_percent][page_idx] = pixmap.copy()
+        self._l2_cache[zoom_percent, page_idx] = pixmap.copy()
 
     def get_cached_pixmap(self, page_idx: int, zoom_percent: int) -> Optional[QPixmap]:
         """Get cached pixmap if available."""
-        if zoom_percent in self._l2_cache:
-            return self._l2_cache[zoom_percent].get(page_idx)
-        return None
+        return self._l2_cache.get(zoom_percent, page_idx)
 
     def has_cached(self, page_idx: int, zoom_percent: int) -> bool:
         """Check if page is cached at given zoom."""
-        if zoom_percent in self._l2_cache:
-            return page_idx in self._l2_cache[zoom_percent]
-        return False
+        return (zoom_percent, page_idx) in self._l2_cache
 
     def cancel_page(self, page_idx: int):
         """Cancel rendering for a specific page."""
@@ -141,8 +155,8 @@ class RenderService(QObject):
         """
         if zoom_percent is None:
             self._l2_cache.clear()
-        elif zoom_percent in self._l2_cache:
-            del self._l2_cache[zoom_percent]
+        else:
+            self._l2_cache.clear_outer(zoom_percent)
 
     def get_base_pixmap(self, page_idx: int) -> Optional[QPixmap]:
         """Get base pixmap for a page."""
@@ -151,3 +165,23 @@ class RenderService(QObject):
     def set_base_pixmap(self, page_idx: int, pixmap: QPixmap):
         """Set base pixmap for a page."""
         self._base_pixmaps[page_idx] = pixmap
+
+    def _on_memory_cleanup(self, aggressive: bool = False):
+        """Memory cleanup callback - clear cache when memory is low."""
+        if aggressive:
+            # Aggressive cleanup: clear all caches
+            self._l2_cache.clear()
+            self._base_pixmaps.clear()
+        else:
+            # Normal cleanup: clear half of base cache
+            keys = list(self._base_pixmaps.keys())
+            for key in keys[:len(keys)//2]:
+                del self._base_pixmaps[key]
+
+    def check_memory(self) -> bool:
+        """Check memory and trigger cleanup if needed."""
+        return self._memory_manager.check_and_cleanup()
+
+    def get_memory_info(self) -> dict:
+        """Get current memory usage info."""
+        return self._memory_manager.get_memory_info()

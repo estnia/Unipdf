@@ -34,6 +34,9 @@ try:
 except ImportError:
     import pymupdf as fitz
 
+# Memory manager
+from pdfviewer.services.memory_manager import MemoryManager
+
 
 class BaseTocWorker(QThread):
     """
@@ -63,6 +66,8 @@ class BaseTocWorker(QThread):
         super().__init__()
         self.doc_path = doc_path
         self._is_running = True
+        # Memory manager for automatic cleanup
+        self._memory_manager = MemoryManager(threshold_mb=600, critical_mb=1200)
 
     def run(self):
         """主流程，子类一般不需要重写"""
@@ -105,7 +110,7 @@ class BaseTocWorker(QThread):
             pages_data.append((page_idx, page.rect.width, page.rect.height, lines))
 
             if page_idx % 10 == 0:
-                fitz.TOOLS.store_shrink(100)
+                self._memory_manager.check_and_cleanup()
 
         doc.close()
 
