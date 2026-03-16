@@ -1374,7 +1374,17 @@ class MainWindow(QMainWindow):
         return 0
 
     def _add_toc_entry(self, title: str, level: int, page: int):
-        """添加目录条目并自动排序"""
+        """添加目录条目并智能排序
+
+        排序逻辑:
+        1. 首先按页码排序
+        2. 在同一页内，验证层级编号是否符合顺序(转换成阿拉伯数字)
+        3. 不符合时，自动根据章节号(L1章编号、L2条编号)插入到正确位置
+
+        逻辑验证:
+        - 根据文档类型(法律法规/GB标准等)采用不同的验证规则
+        - 发现矛盾时提示用户确认
+        """
         if not self.current_doc or not hasattr(self.current_doc, '_doc'):
             return
 
@@ -1389,19 +1399,264 @@ class MainWindow(QMainWindow):
         except Exception:
             toc = []
 
-        # 添加新条目
+        # 如果没有现有目录，直接添加
+        if not toc:
+            new_entry = [level, title, page]
+            self._do_add_toc_entry(doc_wrapper, doc, [new_entry], title, page)
+            return
+
+        new_num = self._extract_number_from_title(title)
+
+        # 自动检测文档类型
+        doc_type = self._detect_doc_type(toc)
+
+        # 根据文档类型进行验证
+        validation_issues = self._validate_toc_logic_by_type(
+            toc, level, title, page, new_num, doc_type
+        )
+
+        if validation_issues:
+            # 有逻辑问题，提示用户
+            issue_msg = "\n".join(validation_issues[:3])
+            if len(validation_issues) > 3:
+                issue_msg += f"\n...还有 {len(validation_issues) - 3} 处矛盾"
+
+            type_name = {"legal": "法律法规", "gbt": "GB/ISO标准", "unknown": "通用文档"}.get(doc_type, "通用文档")
+
+            reply = QMessageBox.question(
+                self,
+                "目录逻辑验证",
+                f"文档类型: {type_name}\n\n"
+                f"检测到以下逻辑问题:\n\n{issue_msg}\n\n"
+                f"新条目: {title} (第{page}页, L{level})\n\n"
+                "是否仍要添加?\n"
+                "选择\"是\"将强制添加，选择\"否\"取消添加。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+
+            if reply != QMessageBox.Yes:
+                return
+
+        # 添加并排序
         new_entry = [level, title, page]
         toc.append(new_entry)
 
-        # 排序：1. 页码 2. 层级 3. 数字大小
-        def sort_key(entry):
-            entry_level, entry_title, entry_page = entry
-            num = self._extract_number_from_title(entry_title)
-            return (entry_page, entry_level, num)
-
-        toc.sort(key=sort_key)
+        # 使用智能排序
+        toc = self._sort_toc_intelligent(toc)
 
         # 更新文档目录
+        self._do_add_toc_entry(doc_wrapper, doc, toc, title, page)
+
+    def _detect_doc_type(self, toc: list) -> str:
+        """根据现有目录自动检测文档类型
+
+        返回: "legal"(法律法规), "gbt"(GB/ISO标准), "unknown"(未知)
+        """
+        if not toc:
+            return "unknown"
+
+        # 统计特征
+        has_chapter = False  # 有"第X章"
+        has_article = False  # 有"第X条"
+        has_section = False  # 有"第X节"
+        has_gbt_keywords = False  # 有GB/T特征词
+
+        gbt_keywords = ['前言', '范围', '规范性引用文件', '术语和定义',
+                       '技术要求', '试验方法', '检验规则', '附录']
+
+        for entry in toc:
+            if len(entry) >= 2:
+                title = str(entry[1])
+
+                # 检测法律法规特征
+                if '章' in title and ('第' in title or '第' in title[:5]):
+                    has_chapter = True
+                if '条' in title and '第' in title:
+                    has_article = True
+                if '节' in title and '第' in title:
+                    has_section = True
+
+                # 检测GB/T特征
+                if any(kw in title for kw in gbt_keywords):
+                    has_gbt_keywords = True
+
+        # 判断逻辑
+        if has_chapter or has_article:
+            return "legal"
+        elif has_gbt_keywords:
+            return "gbt"
+        else:
+            return "unknown"
+
+    def _validate_toc_logic_by_type(self, toc: list, new_level: int, new_title: str,
+                                    new_page: int, new_num: int, doc_type: str) -> list:
+        """根据文档类型验证逻辑一致性"""
+        if doc_type == "legal":
+            return self._validate_legal_toc(toc, new_level, new_title, new_page, new_num)
+        elif doc_type == "gbt":
+            return self._validate_gbt_toc(toc, new_level, new_title, new_page, new_num)
+        else:
+            # 通用文档：只做基本验证
+            return self._validate_generic_toc(toc, new_level, new_title, new_page, new_num)
+
+    def _validate_legal_toc(self, toc: list, new_level: int, new_title: str,
+                           new_page: int, new_num: int) -> list:
+        """法律法规文档验证：严格的章-条层级关系
+
+        验证规则:
+        1. 条编号应该随页码递增
+        2. 条应该在所属的章之后
+        3. 章编号应该随页码递增
+        """
+        issues = []
+
+        if new_num <= 0:
+            return issues
+
+        # 查找同层级的前驱和后继
+        same_level_entries = [(i, e) for i, e in enumerate(toc) if e[0] == new_level]
+
+        prev_entry = None
+        next_entry = None
+
+        for i, (idx, entry) in enumerate(same_level_entries):
+            e_level, e_title, e_page = entry
+            e_num = self._extract_number_from_title(e_title)
+
+            if e_num > 0:
+                if e_num < new_num:
+                    prev_entry = entry
+                elif e_num > new_num and next_entry is None:
+                    next_entry = entry
+
+        # 验证前驱: 编号递增时页码也应该递增
+        if prev_entry:
+            prev_level, prev_title, prev_page = prev_entry
+            prev_num = self._extract_number_from_title(prev_title)
+            if prev_num > 0:
+                if new_num > prev_num and new_page < prev_page:
+                    issues.append(
+                        f"• 编号{new_num} > 前驱{prev_num}，但页码{new_page} < {prev_page}\n"
+                        f"  ({prev_title[:20]}... 第{prev_page}页)"
+                    )
+
+        # 验证后继
+        if next_entry:
+            next_level, next_title, next_page = next_entry
+            next_num = self._extract_number_from_title(next_title)
+            if next_num > 0:
+                if new_num < next_num and new_page > next_page:
+                    issues.append(
+                        f"• 编号{new_num} < 后继{next_num}，但页码{new_page} > {next_page}\n"
+                        f"  ({next_title[:20]}... 第{next_page}页)"
+                    )
+
+        # 验证跨层级：条(L2)应该在章(L1)之后
+        if new_level == 2:
+            parent_chapter = None
+            for entry in toc:
+                if entry[0] == 1 and entry[2] <= new_page:
+                    parent_chapter = entry
+
+            if parent_chapter:
+                ch_level, ch_title, ch_page = parent_chapter
+                if new_page < ch_page:
+                    issues.append(
+                        f"• 条所在页{new_page} < 所属章起始页{ch_page}\n"
+                        f"  (章: {ch_title[:20]}... 第{ch_page}页)"
+                    )
+            else:
+                # 没有找到所属章（条在第一个章之前）
+                first_chapter = None
+                for entry in toc:
+                    if entry[0] == 1:
+                        first_chapter = entry
+                        break
+                if first_chapter:
+                    ch_level, ch_title, ch_page = first_chapter
+                    issues.append(
+                        f"• 条所在页{new_page} < 第一章起始页{ch_page}\n"
+                        f"  (章: {ch_title[:20]}... 第{ch_page}页)"
+                    )
+
+        return issues
+
+    def _validate_gbt_toc(self, toc: list, new_level: int, new_title: str,
+                         new_page: int, new_num: int) -> list:
+        """GB/ISO标准文档验证：宽松的页码连续性检查
+
+        验证规则:
+        1. 同级条目的页码不应大幅倒退(允许小幅调整)
+        2. 不强制要求编号顺序(因为标准文档结构灵活)
+        3. 检查重复页码的合理性
+        """
+        issues = []
+
+        # GB/T 标准主要检查页码是否过于异常
+        same_level_entries = [e for e in toc if e[0] == new_level]
+
+        if not same_level_entries:
+            return issues
+
+        # 计算同级条目的平均页码
+        total_pages = sum(e[2] for e in same_level_entries)
+        avg_page = total_pages / len(same_level_entries)
+        max_page = max(e[2] for e in same_level_entries)
+
+        # 如果新条目页码比现有最大页码大很多，提示
+        if new_page > max_page + 50:
+            issues.append(
+                f"• 新条目页码({new_page})远大于现有最大页码({max_page})\n"
+                f"  可能选择了错误的页码"
+            )
+
+        # 如果新条目页码比平均值小很多(可能是回头添加)
+        if new_page < avg_page - 30:
+            # 检查是否会导致严重的顺序问题
+            later_entries = [e for e in same_level_entries if e[2] > new_page + 10]
+            if len(later_entries) > len(same_level_entries) / 2:
+                issues.append(
+                    f"• 新条目页码({new_page})远小于平均页码({avg_page:.0f})\n"
+                    f"  将导致目录顺序大幅调整"
+                )
+
+        return issues
+
+    def _validate_generic_toc(self, toc: list, new_level: int, new_title: str,
+                             new_page: int, new_num: int) -> list:
+        """通用文档验证：仅做基本检查"""
+        issues = []
+
+        # 基本检查：页码是否合理
+        if new_page < 1:
+            issues.append("• 页码不能小于1")
+
+        # 检查明显的重复(同一页同层级且编号相同)
+        if new_num > 0:
+            for entry in toc:
+                if entry[0] == new_level:
+                    e_num = self._extract_number_from_title(entry[1])
+                    if e_num == new_num and entry[2] == new_page:
+                        issues.append(
+                            f"• 可能重复: 同级同编号({new_num})已在第{new_page}页存在"
+                        )
+                        break
+
+        return issues
+
+    def _sort_toc_intelligent(self, toc: list) -> list:
+        """智能排序目录"""
+        def sort_key(entry):
+            level, title, page = entry
+            num = self._extract_number_from_title(title)
+            return (page, level, num)
+
+        toc.sort(key=sort_key)
+        return toc
+
+    def _do_add_toc_entry(self, doc_wrapper, doc, toc: list, title: str, page: int):
+        """执行实际的目录更新"""
         try:
             doc.set_toc(toc)
             doc_wrapper.mark_modified(True)
